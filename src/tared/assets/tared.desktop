@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Tared
+Comment=Precision formulation, batch scaling, and production management
+Exec=tared
+Icon=tared
+Categories=Science;Chemistry;
+Terminal=false
+StartupNotify=true

@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body {
+    font-family: sans-serif;
+    background-color: #ffffff;
+    color: #111111;
+    font-size: 9pt;
+    margin: 0;
+    padding: 0;
+  }
+  table.header-table {
+    width: 100%;
+    border-bottom: 2px solid #222222;
+    margin-bottom: 8px;
+  }
+  h1.recipe-title {
+    font-size: 15pt;
+    margin: 0;
+    color: #000000;
+  }
+  table.batch-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 6px;
+    margin-bottom: 6px;
+  }
+  table.batch-table th {
+    background-color: #e9ecef;
+    border-top: 1px solid #777777;
+    border-bottom: 2px solid #222222;
+    padding: 4px 3px;
+    font-size: 8.5pt;
+    white-space: nowrap;
+  }
+  table.batch-table td {
+    padding: 4px 3px;
+    border-bottom: 1px solid #dddddd;
+    font-size: 8.5pt;
+  }
+  .col-tare {
+    font-weight: bold;
+    background-color: #f1f5f9;
+  }
+  table.summary-table {
+    width: 100%;
+    border-top: 2px solid #222222;
+    margin-top: 6px;
+    margin-bottom: 6px;
+  }
+  table.summary-table td {
+    padding: 4px 3px;
+    font-size: 9.5pt;
+    font-weight: bold;
+  }
+  .notes-box {
+    border: 1px solid #888888;
+    padding: 6px 8px;
+    margin-top: 6px;
+    font-size: 8.5pt;
+  }
+</style>
+</head>
+<body>
+<table class="header-table" cellpadding="2" cellspacing="0">
+  <tr>
+    <td align="left" width="55%" valign="top">
+      <h1 class="recipe-title">{{ RECIPE_NAME }}</h1>
+      <div style="font-size: 8.5pt; color: #555555; margin-top: 2px;">
+        PRODUCTION BATCH EXECUTION SHEET &bull; <strong>Formula Rev v{{ RECIPE_VERSION }}</strong>
+      </div>
+    </td>
+    <td align="right" width="45%" valign="top" style="font-size: 8.5pt;">
+      <div><strong>Batch #:</strong> {{ BATCH_NUMBER }}</div>
+      <div><strong>Generated:</strong> {{ GENERATED_AT }}</div>
+      <div><strong>Operator:</strong> {{ OPERATOR }}</div>
+      <div><strong>Target Mass:</strong> {{ TARGET_WEIGHT }}</div>
+    </td>
+  </tr>
+</table>
+
+<table class="batch-table" cellpadding="0" cellspacing="0">
+  <thead>
+    <tr>
+      <th align="center" width="5%">#</th>
+      <th align="left" width="35%">Ingredient Name</th>
+      <th align="right" width="11%">Formula %</th>
+      <th align="right" width="15%">Net Weight</th>
+      <th align="right" width="16%">Cumulative Tare</th>
+      <th align="right" width="13%">Cost</th>
+      <th align="center" width="5%">&#10003;</th>
+    </tr>
+  </thead>
+  <tbody>
+    {{ TABLE_ROWS }}
+  </tbody>
+</table>
+
+<table class="summary-table" cellpadding="0" cellspacing="0">
+  <tr>
+    <td align="left" width="30%">Total Compounded Weight:</td>
+    <td align="right" width="20%">{{ TOTAL_WEIGHT }}</td>
+    <td align="right" width="25%">Total Batch Cost:</td>
+    <td align="right" width="25%">{{ TOTAL_COST }}</td>
+  </tr>
+  {{ DEVIATION_ROW }}
+</table>
+{{ COST_FOOTNOTE }}
+
+<div class="notes-box">
+  <div style="margin-bottom: 4px;">
+    <strong>Master Formula Instructions:</strong><br>
+    {{ FORMULA_INSTRUCTIONS }}
+  </div>
+  <div style="border-top: 1px dashed #bbbbbb; padding-top: 4px;">
+    <strong>Batch Execution Notes:</strong><br>
+    {{ BATCH_NOTES }}
+  </div>
+</div>
+
+<table width="100%" cellpadding="0" cellspacing="0" style="margin-top: 16px;">
+  <tr>
+    <td width="30%" style="border-bottom: 1px solid #222222; height: 22px;">&nbsp;</td>
+    <td width="5%">&nbsp;</td>
+    <td width="30%" style="border-bottom: 1px solid #222222; height: 22px;">&nbsp;</td>
+    <td width="5%">&nbsp;</td>
+    <td width="30%" style="border-bottom: 1px solid #222222; height: 22px;">&nbsp;</td>
+  </tr>
+  <tr>
+    <td align="left" style="font-size: 8.5pt; color: #444444; padding-top: 3px;">Compounded By: <strong>{{ OPERATOR }}</strong></td>
+    <td>&nbsp;</td>
+    <td align="left" style="font-size: 8.5pt; color: #444444; padding-top: 3px;">Verified By (Lead / Supervisor)</td>
+    <td>&nbsp;</td>
+    <td align="left" style="font-size: 8.5pt; color: #444444; padding-top: 3px;">Sign-Off Date &amp; Time</td>
+  </tr>
+</table>
+</body>
+</html>

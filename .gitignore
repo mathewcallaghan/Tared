@@ -1,0 +1,41 @@
+# Bytecode and Python runtime caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Build directories & PyInstaller artifacts
+build/
+dist/
+*.spec
+AppDir/
+*.AppImage
+
+# Virtual environments
+.venv/
+venv/
+env/
+.build_venv/
+
+# Package distributions
+*.egg-info/
+.eggs/
+*.egg
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local databases and runtime state
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE, Editor, and OS artifacts
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
