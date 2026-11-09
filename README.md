@@ -8,6 +8,10 @@
 
 A desktop formulation suite and production scaling manager built with **Python 3.11+**, **PyQt6**, and **SQLite**. Packageable as a standalone Linux **AppImage**.
 
+<p align="center">
+  <img src="assets/screenshot-main.jpg" alt="Tared main screen" width="850">
+</p>
+
 > **Important Regulatory Notice:** Tared is an engineering calculation, compounding preparation, and record-keeping tool. It is **not** a validated electronic records system under FDA 21 CFR Part 11, EU Annex 11, or cGMP compounding frameworks. It does not provide cryptographic user authentication, tamper-evident audit hardware, or multi-party electronic signatures. Batch execution sheets must be reviewed and verified by qualified personnel against your facility's Standard Operating Procedures (SOPs).
 
 ---
