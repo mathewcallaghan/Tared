@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="src/tared/assets/tared-logo-tile.svg" alt="Tared" width="360" height="107">
+  <img src="src/tared/assets/tared-logo-tile.png" alt="Tared" width="360" height="107">
 </p>
 
 # Tared
