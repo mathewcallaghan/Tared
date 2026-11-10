@@ -83,7 +83,7 @@ jobs:
           ./"${APPIMAGE_BIN}" --appimage-extract-and-run --help
 
       - name: Upload AppImage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: tared-linux-appimage
           path: Tared-*.AppImage
