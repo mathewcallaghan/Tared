@@ -4,7 +4,7 @@
 
 # Tared
 
-### Precision Batch Formulation & Mass Conservation Engine
+### Desktop formulation and batch compounding suite.
 
 A desktop formulation suite and production scaling manager built with **Python 3.11+**, **PyQt6**, and **SQLite**. Packageable as a standalone Linux **AppImage**.
 

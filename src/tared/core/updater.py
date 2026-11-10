@@ -304,13 +304,33 @@ def verify_binary_payload(file_path: Path, expected_sha256: str) -> bool:
     return actual == clean_expected
 
 
-def apply_appimage_update(staged_binary: Path, target_appimage: Path, expected_sha256: str) -> None:
-    """Atomically swap the running AppImage binary with verified staged payload."""
+def apply_appimage_update(
+    staged_binary: Path,
+    target_appimage: Path,
+    expected_sha256: str,
+    new_asset_name: str = "",
+) -> Path:
+    """Atomically install verified staged payload, updating filename if versioned."""
     if not verify_binary_payload(staged_binary, expected_sha256=expected_sha256):
         raise ValueError("Staged update failed binary verification check.")
 
     staged_binary.chmod(staged_binary.stat().st_mode | 0o755)
-    os.replace(str(staged_binary), str(target_appimage))
+
+    # If current filename has a version pattern, rename to new versioned asset name
+    dest_path = target_appimage
+    if new_asset_name and re.search(r"[-_]v?\d+\.\d+", target_appimage.name):
+        dest_path = target_appimage.parent / new_asset_name
+
+    os.replace(str(staged_binary), str(dest_path))
+
+    # Clean up old file if renamed to a different filename
+    if dest_path.resolve() != target_appimage.resolve() and target_appimage.exists():
+        try:
+            target_appimage.unlink()
+        except OSError:
+            pass
+
+    return dest_path
 
 
 def restart_appimage(appimage_path: Path) -> None:

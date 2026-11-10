@@ -214,10 +214,13 @@ class UpdateDialog(QDialog):
             return
 
         try:
-            apply_appimage_update(
-                self._staged_binary, current_appimage, expected_sha256=self._update_info.expected_sha256
+            final_path = apply_appimage_update(
+                self._staged_binary,
+                current_appimage,
+                expected_sha256=self._update_info.expected_sha256,
+                new_asset_name=self._update_info.asset_name,
             )
-            restart_appimage(current_appimage)
+            restart_appimage(final_path)
         except Exception as err:
             QMessageBox.critical(self, "Update Failed", f"Could not replace AppImage binary:\n{err}")
 
