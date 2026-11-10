@@ -1,6 +1,7 @@
 """JSON serialization and deserialization for discrete recipe interchange."""
 
 import json
+import os
 import uuid
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -93,9 +94,30 @@ def import_recipe_from_json(json_content: str) -> Recipe:
 
 
 def save_recipe_to_file(recipe: Recipe, file_path: str | Path) -> None:
-    path = Path(file_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(export_recipe_to_json(recipe), encoding="utf-8")
+    dest_path = Path(file_path).resolve()
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    staging_path = dest_path.parent / f".tmp_{dest_path.name}_{uuid.uuid4().hex[:8]}"
+    try:
+        content = export_recipe_to_json(recipe)
+        with open(staging_path, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(staging_path), str(dest_path))
+        try:
+            dir_fd = os.open(str(dest_path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
+    finally:
+        if staging_path.exists():
+            try:
+                staging_path.unlink()
+            except OSError:
+                pass
 
 
 def load_recipe_from_file(file_path: str | Path) -> Recipe:

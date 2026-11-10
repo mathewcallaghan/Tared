@@ -67,7 +67,11 @@ class TestWorkspaceIO(unittest.TestCase):
 
         with self.assertRaises(Exception) as ctx:
             restore_workspace_from_json(self.repo, corrupted_file)
-        self.assertIn("Foreign key integrity check failed", str(ctx.exception))
+        err_msg = str(ctx.exception)
+        self.assertTrue(
+            "references non-existent recipe revision" in err_msg
+            or "Foreign key integrity check failed" in err_msg
+        )
 
         # Assert active database was not replaced or corrupted
         batches = self.repo.list_batches(self.recipe.id)
@@ -77,21 +81,85 @@ class TestWorkspaceIO(unittest.TestCase):
     def test_inspect_workspace_tolerates_in_progress_drafts_without_aborting_restoration(self) -> None:
         data = export_workspace_to_dict(self.repo)
         data["recipes"][0]["ingredients"][0]["percentage"] = "50.00"
-        corrupt_rev_items = json.dumps([{"name": "Draft Component", "percentage": "40.00", "cost_per_unit": "1.00"}])
-        data["revisions"][0]["ingredients_json"] = corrupt_rev_items
+
+        # Revision at version 2 reflects the saved draft formulation
+        draft_rev_items = [
+            {"name": it["name"], "percentage": str(it["percentage"]), "cost_per_unit": str(it["cost_per_unit"])}
+            for it in data["recipes"][0]["ingredients"]
+        ]
+        for rev in data["revisions"]:
+            if rev["recipe_id"] == data["recipes"][0]["id"] and rev["version"] == data["recipes"][0]["version"]:
+                rev["ingredients_json"] = json.dumps(draft_rev_items)
 
         draft_file = Path(self.temp_dir.name) / "draft_workspace.json"
         draft_file.write_text(json.dumps(data), encoding="utf-8")
 
         stats = inspect_workspace_file(draft_file)
         self.assertIn(data["recipes"][0]["name"], stats["draft_recipes"])
-        self.assertGreaterEqual(len(stats["draft_revisions"]), 1)
 
         restore_workspace_from_json(self.repo, draft_file)
         restored = self.repo.get_recipe(data["recipes"][0]["id"])
         self.assertIsNotNone(restored)
         assert restored is not None
         self.assertEqual(restored.ingredients[0].percentage, Decimal("50.00"))
+
+    def test_inspect_workspace_rejects_recipe_contradicting_own_revision(self) -> None:
+        data = export_workspace_to_dict(self.repo)
+        data["recipes"][0]["ingredients"][0]["percentage"] = "99.99"
+        data["recipes"][0]["ingredients"][1]["percentage"] = "0.01"
+
+        corrupt_file = Path(self.temp_dir.name) / "contradictory_revision.json"
+        corrupt_file.write_text(json.dumps(data), encoding="utf-8")
+
+        with self.assertRaises(ValueError) as ctx:
+            inspect_workspace_file(corrupt_file)
+        self.assertIn("contradicts its immutable revision snapshot", str(ctx.exception))
+
+    def test_inspect_workspace_rejects_duplicate_batch_numbers(self) -> None:
+        data = export_workspace_to_dict(self.repo)
+        dupe_batch = dict(data["batches"][0])
+        dupe_batch["id"] = "new-dupe-id"
+        data["batches"].append(dupe_batch)
+
+        corrupt_file = Path(self.temp_dir.name) / "duplicate_batch_num.json"
+        corrupt_file.write_text(json.dumps(data), encoding="utf-8")
+
+        with self.assertRaises(ValueError) as ctx:
+            inspect_workspace_file(corrupt_file)
+        self.assertIn("Duplicate batch number", str(ctx.exception))
+
+    def test_inspect_workspace_rejects_batch_referencing_nonexistent_revision(self) -> None:
+        data = export_workspace_to_dict(self.repo)
+        data["batches"][0]["recipe_version"] = 999
+
+        corrupt_file = Path(self.temp_dir.name) / "unlinked_batch.json"
+        corrupt_file.write_text(json.dumps(data), encoding="utf-8")
+
+        with self.assertRaises(ValueError) as ctx:
+            inspect_workspace_file(corrupt_file)
+        self.assertIn("references non-existent recipe revision", str(ctx.exception))
+
+    def test_inspect_workspace_rejects_batch_with_malformed_items_json(self) -> None:
+        data = export_workspace_to_dict(self.repo)
+        data["batches"][0]["items_json"] = "not-valid-json{"
+
+        corrupt_file = Path(self.temp_dir.name) / "corrupt_items_json.json"
+        corrupt_file.write_text(json.dumps(data), encoding="utf-8")
+
+        with self.assertRaises(ValueError) as ctx:
+            inspect_workspace_file(corrupt_file)
+        self.assertIn("malformed items_json", str(ctx.exception))
+
+    def test_inspect_workspace_rejects_revision_missing_recipe_id(self) -> None:
+        data = export_workspace_to_dict(self.repo)
+        data["revisions"][0]["recipe_id"] = ""
+
+        corrupt_file = Path(self.temp_dir.name) / "missing_rec_id.json"
+        corrupt_file.write_text(json.dumps(data), encoding="utf-8")
+
+        with self.assertRaises(ValueError) as ctx:
+            inspect_workspace_file(corrupt_file)
+        self.assertIn("missing required 'recipe_id'", str(ctx.exception))
 
     def test_inspect_workspace_rejects_structural_negative_percentage(self) -> None:
         corrupted_data = export_workspace_to_dict(self.repo)
@@ -119,12 +187,10 @@ class TestWorkspaceIO(unittest.TestCase):
         with self.assertRaises(ValueError):
             import_catalog_from_json_file(self.repo, bad_file)
 
-        # Confirm atomicity: 'Good Material' was not partially inserted
         self.assertIsNone(self.repo.get_catalog_ingredient("Good Material"))
 
     def test_inspect_workspace_rejects_malformed_ingredients_json(self) -> None:
         bad_rev_data = export_workspace_to_dict(self.repo)
-        # Taint ingredients_json to not be a list of dicts
         bad_rev_data["revisions"][0]["ingredients_json"] = json.dumps({"not": "a list"})
 
         bad_file = Path(self.temp_dir.name) / "bad_json.json"
@@ -137,21 +203,17 @@ class TestWorkspaceIO(unittest.TestCase):
     def test_backup_rotation_preserves_three_generations(self) -> None:
         backup_file = Path(self.temp_dir.name) / "rotation_test.json"
 
-        # Generation 1
         export_workspace_to_json_file(self.repo, backup_file, max_rotations=3)
         self.assertTrue(backup_file.is_file())
         self.assertFalse(backup_file.with_name("rotation_test.1.json").exists())
 
-        # Generation 2
         export_workspace_to_json_file(self.repo, backup_file, max_rotations=3)
         self.assertTrue(backup_file.with_name("rotation_test.1.json").is_file())
 
-        # Generation 3
         export_workspace_to_json_file(self.repo, backup_file, max_rotations=3)
         self.assertTrue(backup_file.with_name("rotation_test.1.json").is_file())
         self.assertTrue(backup_file.with_name("rotation_test.2.json").is_file())
 
-        # Generation 4
         export_workspace_to_json_file(self.repo, backup_file, max_rotations=3)
         self.assertTrue(backup_file.with_name("rotation_test.1.json").is_file())
         self.assertTrue(backup_file.with_name("rotation_test.2.json").is_file())
@@ -168,7 +230,7 @@ class TestWorkspaceIO(unittest.TestCase):
         self.assertEqual(len(data["batches"]), 1)
 
         self.assertEqual(data["batches"][0]["batch_number"], "BAT-WS-001")
-        self.assertEqual(data["catalog"][0]["name"], "Sugar")  # Alphabetical NOCASE
+        self.assertEqual(data["catalog"][0]["name"], "Sugar")
         self.assertEqual(data["recipes"][0]["version"], 2)
 
     def test_export_to_json_file_creates_valid_file_atomically(self) -> None:
@@ -178,7 +240,6 @@ class TestWorkspaceIO(unittest.TestCase):
         self.assertTrue(exported_path.is_file())
         self.assertGreater(exported_path.stat().st_size, 500)
 
-        # Confirm no residual staging files
         staging_files = list(out_file.parent.glob(".tmp_*"))
         self.assertEqual(len(staging_files), 0)
 
@@ -206,12 +267,10 @@ class TestWorkspaceIO(unittest.TestCase):
         backup_json = Path(self.temp_dir.name) / "workspace_full.json"
         export_workspace_to_json_file(self.repo, backup_json)
 
-        # Mutate the active database
         self.repo.save_catalog_ingredient(CatalogIngredient("New Contaminant", Decimal("99.99")))
         self.repo.delete_recipe(self.recipe.id)
         self.assertEqual(len(self.repo.list_recipes()), 0)
 
-        # Restore from backup
         safety_dir = Path(self.temp_dir.name) / "safety_snapshots"
         safety_backup = restore_workspace_from_json(self.repo, backup_json, pre_restore_backup_dir=safety_dir)
 
@@ -220,7 +279,6 @@ class TestWorkspaceIO(unittest.TestCase):
         self.assertTrue(safety_backup.is_file())
         self.assertIn("recipes_pre_restore_", safety_backup.name)
 
-        # Verify restored state matches original exactly
         restored_recipes = self.repo.list_recipes()
         self.assertEqual(len(restored_recipes), 1)
         self.assertEqual(restored_recipes[0].name, "Benchmark Formulation Rev 2")
@@ -239,7 +297,6 @@ class TestWorkspaceIO(unittest.TestCase):
 
     def test_restore_workspace_in_memory_repository(self) -> None:
         mem_repo = SQLiteRecipeRepository(":memory:")
-        # Seed populated recipe with immutable revision to test drop/recreate avoids trigger abort
         populated_recipe = Recipe(
             id="mem-existing-01",
             name="Existing Mem Recipe",
@@ -258,8 +315,6 @@ class TestWorkspaceIO(unittest.TestCase):
         self.assertEqual(len(mem_repo.list_catalog_ingredients()), 2)
         mem_repo.close()
 
-
-
     def test_inspect_workspace_rejects_corrupted_batch_record(self) -> None:
         data = export_workspace_to_dict(self.repo)
         data['batches'][0]['target_weight'] = 'not-a-decimal'
@@ -269,6 +324,7 @@ class TestWorkspaceIO(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx:
             inspect_workspace_file(corrupt_file)
         self.assertIn('invalid numeric metrics', str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

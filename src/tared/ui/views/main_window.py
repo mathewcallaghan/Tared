@@ -152,6 +152,7 @@ class MainWindow(QMainWindow):
         curr_ver = getattr(tared, "__version__", "1.0.0")
         self._startup_update_worker = CheckUpdateWorker(curr_ver, self)
         self._startup_update_worker.check_finished.connect(self._on_startup_update_checked)
+        self._startup_update_worker.finished.connect(self._startup_update_worker.deleteLater)
         self._startup_update_worker.start()
 
     def _on_startup_update_checked(self, is_available: bool, info: Any, msg: str) -> None:
@@ -194,7 +195,6 @@ class MainWindow(QMainWindow):
         side_btn_layout.addWidget(self.btn_delete)
         side_layout.addLayout(side_btn_layout)
 
-        # Backward-compatible references
         self.btn_import = QPushButton("Import JSON")
         self.btn_export = QPushButton("Export JSON")
         self.btn_catalog = QPushButton("Raw Materials Catalog...")
@@ -209,7 +209,6 @@ class MainWindow(QMainWindow):
         editor_widget = QWidget()
         editor_layout = QVBoxLayout(editor_widget)
 
-        # Header Metadata Row
         header_form = QFormLayout()
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("Formula Name")
@@ -223,12 +222,11 @@ class MainWindow(QMainWindow):
         header_form.addRow("Version Status:", self.rev_label)
         editor_layout.addLayout(header_form)
 
-        # Scaling, Batch Control, and Precision Selector
         batch_ctrl_layout = QHBoxLayout()
         batch_ctrl_layout.addWidget(QLabel("Target Batch Mass (g):"))
 
         self.target_weight_spin = QDoubleSpinBox()
-        self.target_weight_spin.setRange(0.01, 10_000_000.0)
+        self.target_weight_spin.setRange(0.001, 1_000_000_000.0)
         self.target_weight_spin.setValue(1000.00)
         self.target_weight_spin.setDecimals(2)
         self.target_weight_spin.setSingleStep(100.0)
@@ -253,7 +251,6 @@ class MainWindow(QMainWindow):
 
         editor_layout.addLayout(batch_ctrl_layout)
 
-        # Ingredient Table
         self.table_model = RecipeTableModel(self)
         self.table_model.set_catalog_lookup(self.service.get_catalog_price)
         self.table_view = QTableView()
@@ -273,7 +270,6 @@ class MainWindow(QMainWindow):
         self.table_view.setItemDelegateForColumn(0, IngredientNameDelegate(self._get_catalog_names, self.table_view))
         editor_layout.addWidget(self.table_view)
 
-        # Table Control Bar: Row Operations (Left) and Sequence / Catalog Tools (Right)
         tbl_btn_layout = QHBoxLayout()
         tbl_btn_layout.setContentsMargins(0, 4, 0, 4)
 
@@ -281,6 +277,11 @@ class MainWindow(QMainWindow):
         self.btn_add_row.setToolTip("Add a new ingredient row")
         self.btn_add_from_catalog = QPushButton("+ From Catalog...")
         self.btn_add_from_catalog.setToolTip("Select ingredients from the raw materials catalog")
+        self.btn_by_weight = QPushButton("⚖ Batch by Weight...")
+        self.btn_by_weight.setToolTip(
+            "Formulate batch by entering ingredient weights; "
+            "percentages and batch size are calculated automatically."
+        )
         self.btn_remove_row = QPushButton("− Remove")
         self.btn_remove_row.setToolTip("Remove selected ingredient row(s)")
         self.btn_move_up = QPushButton("▲")
@@ -302,12 +303,12 @@ class MainWindow(QMainWindow):
         self.action_open_catalog.setToolTip("View and edit the complete raw materials catalog.")
         self.btn_catalog_menu.setMenu(catalog_menu)
 
-        # Retain backward-compatible references
         self.btn_add_to_catalog = self.action_add_to_catalog
         self.btn_sync_costs = self.action_sync_costs
 
         tbl_btn_layout.addWidget(self.btn_add_row)
         tbl_btn_layout.addWidget(self.btn_add_from_catalog)
+        tbl_btn_layout.addWidget(self.btn_by_weight)
         tbl_btn_layout.addWidget(self.btn_remove_row)
         tbl_btn_layout.addWidget(self.btn_move_up)
         tbl_btn_layout.addWidget(self.btn_move_down)
@@ -329,25 +330,28 @@ class MainWindow(QMainWindow):
 
         editor_layout.addLayout(tbl_btn_layout)
 
-        # Bottom Bar: Summary & Actions
         bottom_bar = QFrame()
         bottom_bar.setFrameShape(QFrame.Shape.StyledPanel)
         bottom_layout = QHBoxLayout(bottom_bar)
+        bottom_layout.setContentsMargins(10, 6, 10, 6)
 
-        self.summary_label = QLabel("Batch Total: 0.00 g | Cost: $0.00")
-        self.summary_label.setStyleSheet("font-weight: bold; font-size: 11pt;")
-        bottom_layout.addWidget(self.summary_label)
-        bottom_layout.addStretch()
+        self.summary_label = QLabel("Batch Target: 0.00 g | Total: 0.00 g" + chr(10) + "Cost: $0.00")
+        self.summary_label.setStyleSheet("font-size: 9pt; font-weight: bold;")
+        self.summary_label.setWordWrap(True)
+        bottom_layout.addWidget(self.summary_label, stretch=1)
 
+        btn_box = QHBoxLayout()
+        btn_box.setSpacing(8)
         self.btn_save = QPushButton("Save Formula")
         self.btn_save.setStyleSheet("font-weight: bold; padding: 6px 14px;")
         self.btn_print = QPushButton("Print Batch Sheet...")
         self.btn_print.setStyleSheet("padding: 6px 14px;")
         self.btn_history = QPushButton("Batch History...")
         self.btn_history.setStyleSheet("padding: 6px 14px;")
-        bottom_layout.addWidget(self.btn_save)
-        bottom_layout.addWidget(self.btn_print)
-        bottom_layout.addWidget(self.btn_history)
+        btn_box.addWidget(self.btn_save)
+        btn_box.addWidget(self.btn_print)
+        btn_box.addWidget(self.btn_history)
+        bottom_layout.addLayout(btn_box)
 
         editor_layout.addWidget(bottom_bar)
         splitter.addWidget(editor_widget)
@@ -367,6 +371,7 @@ class MainWindow(QMainWindow):
         self.action_open_catalog.triggered.connect(self._open_catalog_dialog)
         self.btn_add_row.clicked.connect(lambda: self.table_model.add_ingredient(name=""))
         self.btn_add_from_catalog.clicked.connect(self._add_from_catalog)
+        self.btn_by_weight.clicked.connect(self._open_batch_by_weight_dialog)
         self.btn_remove_row.clicked.connect(self._remove_selected_ingredient)
         self.btn_move_up.clicked.connect(self._move_selected_row_up)
         self.btn_move_down.clicked.connect(self._move_selected_row_down)
@@ -386,6 +391,33 @@ class MainWindow(QMainWindow):
         self.table_model.rowsRemoved.connect(lambda: self._set_dirty(True))
         self.table_model.edit_rejected.connect(lambda msg: self.statusBar().showMessage(msg, 4000))
 
+    def _trigger_auto_backup(self, silent: bool = True) -> bool:
+        """Trigger automated workspace backup to configured sync folder if enabled."""
+        if (
+            not self.config.is_backup_configured()
+            or getattr(self.repo, "_is_memory", False)
+            or not hasattr(self.repo, "list_all_recipes_data")
+        ):
+            return False
+
+        try:
+            target_file = Path(self.config.auto_backup_dir) / "tared_workspace.json"
+            export_workspace_to_json_file(self.repo, target_file, max_rotations=3)
+            self.config.record_backup_result(True)
+            return True
+        except Exception as backup_err:
+            import logging
+
+            logging.getLogger(__name__).warning("Automated workspace backup failed: %s", backup_err)
+            self.config.record_backup_result(False, str(backup_err))
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "Automated Backup Failed",
+                    f"Automated backup to cloud sync folder failed:\n{backup_err}",
+                )
+            return False
+
     def _on_header_metadata_changed(self) -> None:
         if not self._is_switching_recipe:
             self._set_dirty(True)
@@ -395,7 +427,7 @@ class MainWindow(QMainWindow):
             )
 
     def _on_table_data_changed(self, top_left: QModelIndex, bottom_right: QModelIndex, roles: list[Any] = []) -> None:
-        if top_left.column() <= 2:
+        if top_left.column() <= 3:
             self._set_dirty(True)
 
     def _set_dirty(self, dirty: bool = True) -> None:
@@ -475,7 +507,17 @@ class MainWindow(QMainWindow):
                 if select_id is not None and r.id == select_id:
                     selected_row = idx
 
-            if recipes:
+            if hasattr(self.repo, "get_corrupted_recipes"):
+                for bad in self.repo.get_corrupted_recipes():
+                    item = QListWidgetItem(f"⚠ {bad['name']} [Corrupted]")
+                    item.setData(Qt.ItemDataRole.UserRole, bad["id"])
+                    item.setData(Qt.ItemDataRole.UserRole + 1, bad["error"])
+                    self.recipe_list.addItem(item)
+                    if select_id is not None and bad["id"] == select_id:
+                        selected_row = self.recipe_list.count() - 1
+
+            total_items = self.recipe_list.count()
+            if total_items > 0:
                 target_idx = selected_row if selected_row >= 0 else 0
                 self.recipe_list.setCurrentRow(target_idx)
                 target_item = self.recipe_list.item(target_idx)
@@ -557,6 +599,27 @@ class MainWindow(QMainWindow):
                 self._set_dirty(False)
             finally:
                 self._is_switching_recipe = prev_switching
+        elif hasattr(self.repo, "get_corrupted_recipes"):
+            corrupted = [b for b in self.repo.get_corrupted_recipes() if b["id"] == recipe_id]
+            if corrupted:
+                prev_switching = self._is_switching_recipe
+                self._is_switching_recipe = True
+                try:
+                    self._current_recipe_id = recipe_id
+                    bad_info = corrupted[0]
+                    self.name_input.setText(bad_info["name"])
+                    self.desc_input.setText("")
+                    self.rev_label.setText(f"Status: Corrupted ({bad_info['error']})")
+                    self.sort_combo.setCurrentIndex(0)
+                    self.table_model.new_draft(name=bad_info["name"], description="")
+                    self.validation_label.setText(f"Corrupted: {bad_info['error']}")
+                    self.validation_label.setStyleSheet(
+                        "color: #842029; background-color: #f8d7da; font-weight: bold; "
+                        "padding: 4px 8px; border-radius: 4px;"
+                    )
+                    self._set_dirty(False)
+                finally:
+                    self._is_switching_recipe = prev_switching
 
     def _create_new_recipe(self) -> None:
         if self._is_dirty:
@@ -594,14 +657,26 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Validation Error", "Formula must contain at least one ingredient.")
             return False
 
+        seen_names = set()
         for row, item in enumerate(self.table_model.ingredients_data):
-            if not item["name"].strip():
+            clean_name = item["name"].strip()
+            if not clean_name:
                 QMessageBox.warning(
                     self,
                     "Validation Error",
                     f"Row {row + 1} has an empty ingredient name.",
                 )
                 return False
+            lower_name = clean_name.lower()
+            if lower_name in seen_names:
+                QMessageBox.warning(
+                    self,
+                    "Validation Error",
+                    f"Row {row + 1} has duplicate ingredient name '{clean_name}'. "
+                    "Ingredient names must be unique within a formula.",
+                )
+                return False
+            seen_names.add(lower_name)
             if item["percentage"] <= Decimal("0"):
                 QMessageBox.warning(
                     self,
@@ -703,6 +778,7 @@ class MainWindow(QMainWindow):
         self._set_dirty(False)
         select_id = target_select_id or saved_recipe.id
         self._load_recipe_archive(select_id=select_id)
+        self._trigger_auto_backup(silent=True)
 
         self.statusBar().showMessage(
             f"Formula '{saved_recipe.name}' (v{saved_recipe.version}) saved successfully.", 3500
@@ -761,6 +837,7 @@ class MainWindow(QMainWindow):
                 self._set_dirty(False)
                 self._current_recipe_id = None
                 self._load_recipe_archive()
+                self._trigger_auto_backup(silent=True)
 
     def _remove_selected_ingredient(self) -> None:
         selection_model = self.table_view.selectionModel()
@@ -780,8 +857,6 @@ class MainWindow(QMainWindow):
 
     def _on_target_weight_changed(self, val: float) -> None:
         try:
-            # Read cleanly parsed string from the spinbox instead of the float value
-            # to avoid IEEE 754 precision loss and localized comma issues
             raw_text = self.target_weight_spin.cleanText()
             clean_str = raw_text.replace(",", ".") if "." not in raw_text else raw_text.replace(",", "")
             self.table_model.set_target_weight(Decimal(clean_str))
@@ -809,18 +884,21 @@ class MainWindow(QMainWindow):
     def _on_batch_updated(self, batch: Any) -> None:
         if batch is not None:
             decimals = self.table_model.precision_decimals
-            summary_parts = [
+            line1_parts = [
                 f"Batch Target: {batch.target_weight:.{decimals}f} g",
                 f"Total: {batch.total_weight:.{decimals}f} g",
             ]
-            if batch.max_allocation_deviation > Decimal("0"):
-                summary_parts.append(f"Max Shift: at most {batch.max_allocation_deviation:.{decimals}f} g")
-            summary_parts.append(
+            line2_parts = [
                 f"Cost: {format_currency(batch.total_cost, precision=self.table_model.cost_precision)}"
-            )
-            self.summary_label.setText(" | ".join(summary_parts))
+            ]
+            if batch.max_allocation_deviation > Decimal("0"):
+                line2_parts.append(f"Max Shift: at most {batch.max_allocation_deviation:.{decimals}f} g")
+
+            line1 = " | ".join(line1_parts)
+            line2 = " | ".join(line2_parts)
+            self.summary_label.setText(line1 + chr(10) + line2)
         else:
-            self.summary_label.setText("Batch Total: — | Cost: —")
+            self.summary_label.setText("Batch Total: —" + chr(10) + "Cost: —")
 
     def _on_table_context_menu(self, pos: QPoint) -> None:
         selected_rows = self._get_selected_table_rows()
@@ -919,6 +997,40 @@ class MainWindow(QMainWindow):
                 "Selected ingredient(s) are already present in catalog with matching prices.", 3000
             )
 
+    def _open_batch_by_weight_dialog(self) -> None:
+        from tared.ui.views.weight_entry_dialog import BatchByWeightDialog
+
+        current_data = []
+        for idx, it in enumerate(self.table_model.ingredients_data):
+            d = dict(it)
+            if self.table_model.current_batch is not None and idx < len(self.table_model.current_batch.items):
+                d["scaled_weight"] = self.table_model.current_batch.items[idx].scaled_weight
+            current_data.append(d)
+
+        dialog = BatchByWeightDialog(
+            repository=self.repo,
+            service=self.service,
+            current_ingredients=current_data,
+            current_target_weight=Decimal(str(self.target_weight_spin.value())),
+            precision=self.table_model.precision,
+            parent=self,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            if not dialog.has_user_edits():
+                return
+            resolved_items = dialog.get_ingredients()
+            target_mass = dialog.get_target_weight()
+            if not resolved_items:
+                return
+
+            self.target_weight_spin.setValue(float(target_mass))
+            self.table_model.set_ingredients_from_weights(resolved_items, target_weight=target_mass)
+            self._set_dirty(True)
+            self.statusBar().showMessage(
+                f"Formula updated from weights: {len(resolved_items)} ingredient(s), {target_mass:.2f} g total.",
+                3500,
+            )
+
     def _open_catalog_dialog(self) -> None:
         active_recipe = self._get_active_recipe_model()
         dialog = CatalogManagerDialog(self.repo, self.service, current_recipe=active_recipe, parent=self)
@@ -952,7 +1064,6 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes,
         )
         if reply == QMessageBox.StandardButton.Yes:
-            # Apply to table model
             for row in range(self.table_model.rowCount()):
                 ing_name = self.table_model.data(self.table_model.index(row, 0))
                 cat_price = self.service.get_catalog_price(ing_name)
@@ -979,7 +1090,6 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def _open_print_dialog(self) -> None:
-        # Check if active formulation is an unpersisted draft
         active_id = self.table_model.recipe_id
         is_persisted = bool(active_id and self.repo.get_recipe(active_id) is not None)
 
@@ -1057,7 +1167,6 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Import Error", f"Failed to parse recipe JSON:\n{err}")
             return
 
-        # Check collision against both active and archived recipes
         existing = self.repo.get_recipe(recipe.id, include_archived=True)
         collision_mode = "copy"
         if existing is not None:
@@ -1074,6 +1183,7 @@ class MainWindow(QMainWindow):
 
         self._set_dirty(False)
         self._load_recipe_archive(select_id=saved_recipe.id)
+        self._trigger_auto_backup(silent=True)
         self.statusBar().showMessage(
             f"Formula '{saved_recipe.name}' (v{saved_recipe.version}) imported successfully.", 3500
         )
@@ -1121,6 +1231,12 @@ class MainWindow(QMainWindow):
 
         # 2. Tools Menu
         tools_menu = menubar.addMenu("&Tools")
+
+        action_by_weight = tools_menu.addAction("Formulate by &Weight...")
+        action_by_weight.setShortcut("Ctrl+W")
+        action_by_weight.triggered.connect(self._open_batch_by_weight_dialog)
+
+        tools_menu.addSeparator()
 
         action_catalog = tools_menu.addAction("Raw &Materials Catalog...")
         action_catalog.setShortcut("Ctrl+M")
@@ -1196,6 +1312,7 @@ class MainWindow(QMainWindow):
         )
         saved = self.service.save_recipe(dupe)
         self._load_recipe_archive(select_id=saved.id)
+        self._trigger_auto_backup(silent=True)
         self.statusBar().showMessage(f"Duplicated formula as '{saved.name}'.", 3500)
 
     def closeEvent(self, event: QCloseEvent) -> None:
@@ -1203,25 +1320,22 @@ class MainWindow(QMainWindow):
             event.accept()
             return
 
-        def _finalize_exit() -> bool:
-            if (
-                self.config.is_backup_configured()
-                and not getattr(self.repo, "_is_memory", False)
-                and hasattr(self.repo, "list_all_recipes_data")
-            ):
-                try:
-                    target_file = Path(self.config.auto_backup_dir) / "tared_workspace.json"
-                    export_workspace_to_json_file(self.repo, target_file, max_rotations=3)
-                    self.config.record_backup_result(True)
-                except Exception as backup_err:
-                    import logging
+        if hasattr(self, "_startup_update_worker") and self._startup_update_worker is not None:
+            try:
+                if self._startup_update_worker.isRunning():
+                    self._startup_update_worker.cancel()
+                    self._startup_update_worker.wait(1000)
+            except RuntimeError:
+                pass
 
-                    logging.getLogger(__name__).warning("Automated workspace backup on exit failed: %s", backup_err)
-                    self.config.record_backup_result(False, str(backup_err))
+        def _finalize_exit() -> bool:
+            if self.config.is_backup_configured() and not getattr(self.repo, "_is_memory", False):
+                if not self._trigger_auto_backup(silent=True):
+                    status = self.config.last_backup_status
                     reply = QMessageBox.warning(
                         self,
                         "Automated Backup Failed",
-                        f"Automated backup to cloud sync folder failed:\n{backup_err}\n\nExit anyway?",
+                        f"Automated backup to cloud sync folder failed:\n{status}\n\nExit anyway?",
                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                         QMessageBox.StandardButton.No,
                     )

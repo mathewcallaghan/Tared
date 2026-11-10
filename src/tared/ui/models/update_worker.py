@@ -5,6 +5,7 @@ from __future__ import annotations
 import urllib.request
 import uuid
 from pathlib import Path
+from typing import Any
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
@@ -26,10 +27,17 @@ class CheckUpdateWorker(QThread):
     def __init__(self, current_version: str, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.current_version = current_version
+        self._is_cancelled = False
+
+    def cancel(self) -> None:
+        self._is_cancelled = True
 
     def run(self) -> None:
+        if self._is_cancelled:
+            return
         is_avail, info, msg = fetch_latest_release_info(self.current_version)
-        self.check_finished.emit(is_avail, info, msg)
+        if not self._is_cancelled:
+            self.check_finished.emit(is_avail, info, msg)
 
 
 class DownloadUpdateWorker(QThread):
@@ -43,9 +51,15 @@ class DownloadUpdateWorker(QThread):
         super().__init__(parent)
         self.update_info = update_info
         self._is_cancelled = False
+        self._active_response: Any = None
 
     def cancel(self) -> None:
         self._is_cancelled = True
+        if self._active_response is not None:
+            try:
+                self._active_response.close()
+            except Exception:
+                pass
 
     def run(self) -> None:
         if not is_safe_update_url(self.update_info.download_url):
@@ -65,6 +79,12 @@ class DownloadUpdateWorker(QThread):
             )
 
             with urllib.request.urlopen(req, timeout=15) as response:
+                self._active_response = response
+                resp_url = getattr(response, "geturl", lambda: None)()
+                if isinstance(resp_url, str) and not is_safe_update_url(resp_url):
+                    self.download_failed.emit(f"Redirect to untrusted update host rejected: {resp_url}")
+                    return
+
                 declared_len = int(response.headers.get("Content-Length", self.update_info.asset_size or 0))
                 if declared_len > MAX_UPDATE_SIZE_BYTES:
                     self.download_failed.emit(
@@ -98,7 +118,6 @@ class DownloadUpdateWorker(QThread):
                         pct = int((bytes_read / total_bytes) * 100) if total_bytes > 0 else 0
                         self.progress.emit(min(pct, 100), bytes_read, total_bytes)
 
-            # Security verification: Fail-closed ELF header and mandatory SHA-256 digest match
             if not self.update_info.expected_sha256:
                 staging_path.unlink(missing_ok=True)
                 self.download_failed.emit("Release lacks a verified SHA-256 digest. Automated update aborted.")
@@ -114,4 +133,7 @@ class DownloadUpdateWorker(QThread):
             self.download_finished.emit(staging_path)
         except Exception as err:
             staging_path.unlink(missing_ok=True)
-            self.download_failed.emit(f"Download failed: {err}")
+            if not self._is_cancelled:
+                self.download_failed.emit(f"Download failed: {err}")
+        finally:
+            self._active_response = None

@@ -96,6 +96,40 @@ class TestCloudBackupWorkflow(unittest.TestCase):
         self.repo.close()
         self.temp_dir.cleanup()
 
+    def test_auto_backup_triggers_immediately_on_recipe_save_and_batch_commit(self) -> None:
+        backup_file = self.cloud_sync_dir / "tared_workspace.json"
+        self.assertFalse(backup_file.exists())
+
+        # 1. Mutate active recipe and save -> triggers immediate automated backup
+        self.window.name_input.setText("Auto Backup Verified Formula")
+        saved = self.window._save_current_recipe()
+        self.assertTrue(saved)
+        self.assertTrue(backup_file.is_file())
+
+        backup_data = json.loads(backup_file.read_text(encoding="utf-8"))
+        saved_names = [r["name"] for r in backup_data["recipes"]]
+        self.assertIn("Auto Backup Verified Formula", saved_names)
+
+        # 2. Commit a new production batch sheet -> triggers immediate automated backup
+        batch = self.window.table_model.current_batch
+        assert batch is not None
+        from tared.ui.views.print_dialog import PrintBatchSheetDialog
+        dialog = PrintBatchSheetDialog(batch, parent=self.window, repository=self.repo, config=self.config)
+        dialog.operator_input.setText("Automated QC Operator")
+        dialog.batch_num_input.setText("BAT-AUTO-SYNC-01")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pdf_out = str(Path(tmpdir) / "sheet.pdf")
+            with patch("PyQt6.QtWidgets.QFileDialog.getSaveFileName", return_value=(pdf_out, "PDF Files (*.pdf)")):
+                dialog._export_pdf()
+
+        dialog.close()
+
+        # Verify updated workspace backup file contains the new batch
+        updated_backup_data = json.loads(backup_file.read_text(encoding="utf-8"))
+        batch_numbers = [b["batch_number"] for b in updated_backup_data["batches"]]
+        self.assertIn("BAT-AUTO-SYNC-01", batch_numbers)
+
     def test_full_cloud_backup_and_disaster_recovery_roundtrip(self) -> None:
         # 1. Close application: triggers automated exit backup to cloud sync folder
         close_evt = QCloseEvent()

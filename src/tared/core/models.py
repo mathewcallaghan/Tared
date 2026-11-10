@@ -74,6 +74,12 @@ class Recipe:
             raise ValueError("Recipe must contain at least one ingredient")
         if isinstance(self.ingredients, list):
             object.__setattr__(self, "ingredients", tuple(self.ingredients))
+        seen_names: set[str] = set()
+        for ing in self.ingredients:
+            k = ing.name.strip().lower()
+            if k in seen_names:
+                raise ValueError(f"Duplicate ingredient name '{ing.name.strip()}' in recipe '{self.name}'")
+            seen_names.add(k)
         if not self.id.strip():
             object.__setattr__(self, "id", str(uuid.uuid4()))
         if self.version < 1:
@@ -109,6 +115,7 @@ class BatchResult:
     zero_weight_ingredients: tuple[str, ...] = ()
     high_deviation_ingredients: tuple[str, ...] = ()
     max_allocation_deviation: Decimal = Decimal("0.00")
+    total_percentage: Decimal = Decimal("100.00")
 
     def __post_init__(self) -> None:
         if not self.target_weight.is_finite() or self.target_weight <= Decimal("0"):
@@ -117,3 +124,5 @@ class BatchResult:
             raise ValueError(f"Precision must be a finite positive number, got {self.precision}")
         if not isinstance(self.max_allocation_deviation, Decimal):
             object.__setattr__(self, "max_allocation_deviation", Decimal(str(self.max_allocation_deviation)))
+        if not isinstance(self.total_percentage, Decimal):
+            object.__setattr__(self, "total_percentage", Decimal(str(self.total_percentage)))

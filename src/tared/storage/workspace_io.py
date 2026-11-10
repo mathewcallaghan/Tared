@@ -38,37 +38,24 @@ def rotate_backups(dest_path: Path, max_rotations: int = 3) -> None:
     first_rot = dest_path.parent / f"{dest_path.stem}.1{dest_path.suffix}"
     try:
         shutil.copy2(str(dest_path), str(first_rot))
+        with open(first_rot, "rb") as rf:
+            os.fsync(rf.fileno())
     except OSError:
         pass
 
 
-def export_workspace_to_dict(repo: SQLiteRecipeRepository) -> dict[str, Any]:
+def export_workspace_to_dict(repo: RecipeRepository) -> dict[str, Any]:
     """Serialize the entire application database (catalog, recipes, revisions, batches) to a dictionary."""
-    catalog = [
-        {
-            "id": item.id,
-            "name": item.name,
-            "cost_per_unit": str(item.cost_per_unit),
-            "supplier": item.supplier,
-            "sku": item.sku,
-            "notes": item.notes,
-            "updated_at": item.updated_at,
-        }
-        for item in repo.list_catalog_ingredients()
-    ]
-
-    recipes = repo.list_all_recipes_data()
-    revisions = repo.list_all_revisions()
-    batches = repo.list_batches()
+    snapshot = repo.export_workspace_snapshot()
 
     return {
         "schema_version": WORKSPACE_SCHEMA_VERSION,
         "exported_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "app_version": getattr(tared, "__version__", "1.0.0"),
-        "catalog": catalog,
-        "recipes": recipes,
-        "revisions": revisions,
-        "batches": batches,
+        "catalog": snapshot["catalog"],
+        "recipes": snapshot["recipes"],
+        "revisions": snapshot["revisions"],
+        "batches": snapshot["batches"],
     }
 
 
@@ -87,10 +74,21 @@ def export_workspace_to_json_file(
 
     staging_path = dest_path.parent / f".tmp_{dest_path.name}_{uuid.uuid4().hex[:8]}"
     try:
-        staging_path.write_text(serialized, encoding="utf-8")
+        with open(staging_path, "w", encoding="utf-8") as f:
+            f.write(serialized)
+            f.flush()
+            os.fsync(f.fileno())
         if dest_path.is_file() and max_rotations > 0:
             rotate_backups(dest_path, max_rotations=max_rotations)
         os.replace(str(staging_path), str(dest_path))
+        try:
+            dir_fd = os.open(str(dest_path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
     finally:
         if staging_path.exists():
             try:
@@ -151,44 +149,28 @@ def inspect_workspace_file(file_path: str | Path) -> dict[str, Any]:
     draft_recipes: list[str] = []
     draft_revisions: list[str] = []
 
-    # 2. Structural & numeric validation for active/archived recipes
-    for idx, r in enumerate(recipes):
-        if not isinstance(r, dict):
-            raise ValueError(f"Malformed recipe at index {idx}: must be an object.")
-        r_name = str(r.get("name", "")).strip()
-        if not r_name:
-            raise ValueError(f"Malformed recipe at index {idx}: formula name cannot be empty.")
-        raw_ings = r.get("ingredients", [])
-        if not isinstance(raw_ings, list) or not raw_ings:
-            raise ValueError(f"Recipe '{r_name}' must contain at least one ingredient.")
-        try:
-            parsed_ings = tuple(
-                Ingredient(
-                    name=str(it.get("name", "")),
-                    percentage=Decimal(str(it.get("percentage", "0"))),
-                    cost_per_unit=Decimal(str(it.get("cost_per_unit", "0.00"))),
-                )
-                for it in raw_ings
-            )
-            rec = Recipe(
-                id=str(r.get("id", uuid.uuid4())),
-                name=r_name,
-                description=str(r.get("description", "")),
-                version=int(r.get("version", 1)),
-                ingredients=parsed_ings,
-            )
-        except Exception as err:
-            raise ValueError(f"Recipe '{r_name}' contains malformed ingredient data: {err}") from err
+    # 2. Structural & referential validation for revision snapshots
+    seen_revisions: set[tuple[str, int]] = set()
+    revisions_map: dict[tuple[str, int], list[dict[str, str]]] = {}
 
-        try:
-            validate_recipe_percentages(rec)
-        except PercentageSumError:
-            draft_recipes.append(r_name)
-
-    # 3. Structural & numeric validation for revision snapshots
     for idx, rev in enumerate(revisions):
         if not isinstance(rev, dict):
             raise ValueError(f"Malformed revision at index {idx}: entry must be a dictionary.")
+        rec_id = str(rev.get("recipe_id", "")).strip()
+        if not rec_id:
+            raise ValueError(f"Malformed revision at index {idx}: missing required 'recipe_id'.")
+        if "version" not in rev:
+            raise ValueError(f"Malformed revision at index {idx}: missing required 'version'.")
+        try:
+            rev_ver = int(rev["version"])
+        except (ValueError, TypeError) as ver_err:
+            raise ValueError(f"Malformed revision at index {idx}: invalid 'version': {ver_err}") from ver_err
+
+        rev_key = (rec_id, rev_ver)
+        if rev_key in seen_revisions:
+            raise ValueError(f"Duplicate revision snapshot found for recipe ID '{rec_id}' version {rev_ver}.")
+        seen_revisions.add(rev_key)
+
         rev_name = rev.get("name", f"Revision #{idx + 1}")
         ing_raw = rev.get("ingredients_json", "[]")
         try:
@@ -203,11 +185,19 @@ def inspect_workspace_file(file_path: str | Path) -> dict[str, Any]:
                 )
                 for it in ing_items
             )
+            revisions_map[rev_key] = [
+                {
+                    "name": str(it.get("name", "")).strip(),
+                    "percentage": str(it.get("percentage", "0")),
+                    "cost_per_unit": str(it.get("cost_per_unit", "0.00")),
+                }
+                for it in ing_items
+            ]
             rev_recipe = Recipe(
-                id=str(rev.get("recipe_id", uuid.uuid4())),
+                id=rec_id,
                 name=str(rev_name),
                 description=str(rev.get("description", "")),
-                version=int(rev.get("version", 1)),
+                version=rev_ver,
                 ingredients=parsed_rev_ings,
             )
         except Exception as parse_err:
@@ -216,19 +206,93 @@ def inspect_workspace_file(file_path: str | Path) -> dict[str, Any]:
         try:
             validate_recipe_percentages(rev_recipe)
         except PercentageSumError:
-            draft_revisions.append(f"{rev_name} (v{rev.get('version', '?')})")
+            draft_revisions.append(f"{rev_name} (v{rev_ver})")
 
-    # 4. Structural & numeric validation for historical production batches
+    # 3. Structural, numeric, and cross-revision validation for active/archived recipes
+    seen_recipe_ids: set[str] = set()
+    for idx, r in enumerate(recipes):
+        if not isinstance(r, dict):
+            raise ValueError(f"Malformed recipe at index {idx}: must be an object.")
+        r_id = str(r.get("id", "")).strip()
+        if not r_id:
+            raise ValueError(f"Malformed recipe at index {idx}: missing required 'id'.")
+        if r_id in seen_recipe_ids:
+            raise ValueError(f"Duplicate recipe ID '{r_id}' found in workspace backup.")
+        seen_recipe_ids.add(r_id)
+
+        r_name = str(r.get("name", "")).strip()
+        if not r_name:
+            raise ValueError(f"Malformed recipe at index {idx}: formula name cannot be empty.")
+        try:
+            r_ver = int(r.get("version", 1))
+        except (ValueError, TypeError) as ver_err:
+            raise ValueError(f"Recipe '{r_name}' has invalid 'version': {ver_err}") from ver_err
+
+        raw_ings = r.get("ingredients", [])
+        if not isinstance(raw_ings, list) or not raw_ings:
+            raise ValueError(f"Recipe '{r_name}' must contain at least one ingredient.")
+        try:
+            parsed_ings = tuple(
+                Ingredient(
+                    name=str(it.get("name", "")),
+                    percentage=Decimal(str(it.get("percentage", "0"))),
+                    cost_per_unit=Decimal(str(it.get("cost_per_unit", "0.00"))),
+                )
+                for it in raw_ings
+            )
+            rec = Recipe(
+                id=r_id,
+                name=r_name,
+                description=str(r.get("description", "")),
+                version=r_ver,
+                ingredients=parsed_ings,
+            )
+        except Exception as err:
+            raise ValueError(f"Recipe '{r_name}' contains malformed ingredient data: {err}") from err
+
+        # Assert parity with revision snapshot at same (id, version) when revisions exist
+        rev_key = (r_id, r_ver)
+        if rev_key in revisions_map:
+            rev_ings = revisions_map[rev_key]
+            if len(rec.ingredients) != len(rev_ings):
+                raise ValueError(
+                    f"Integrity violation in backup: Recipe '{r_name}' (id='{r_id}', v{r_ver}) "
+                    f"ingredient count ({len(rec.ingredients)}) does not match its revision snapshot ({len(rev_ings)})."
+                )
+            for r_ing, rev_ing in zip(rec.ingredients, rev_ings):
+                if (
+                    r_ing.name.strip() != rev_ing["name"]
+                    or r_ing.percentage != Decimal(rev_ing["percentage"])
+                    or r_ing.cost_per_unit != Decimal(rev_ing["cost_per_unit"])
+                ):
+                    raise ValueError(
+                        f"Integrity violation in backup: Recipe '{r_name}' (id='{r_id}', v{r_ver}) "
+                        f"contradicts its immutable revision snapshot at the same version."
+                    )
+
+        try:
+            validate_recipe_percentages(rec)
+        except PercentageSumError:
+            draft_recipes.append(r_name)
+
+    # 4. Structural, numeric, and referential validation for historical production batches
+    seen_batch_numbers: set[str] = set()
     for idx, b in enumerate(batches):
         if not isinstance(b, dict):
             raise ValueError(f"Malformed batch entry at index {idx}: entry must be a dictionary.")
         batch_num = str(b.get("batch_number", "")).strip()
         if not batch_num:
             raise ValueError(f"Malformed batch at index {idx}: 'batch_number' cannot be empty.")
-        if not str(b.get("recipe_id", "")).strip():
+        b_num_key = batch_num.lower()
+        if b_num_key in seen_batch_numbers:
+            raise ValueError(f"Duplicate batch number '{batch_num}' found in workspace backup.")
+        seen_batch_numbers.add(b_num_key)
+
+        b_rec_id = str(b.get("recipe_id", "")).strip()
+        if not b_rec_id:
             raise ValueError(f"Batch '{batch_num}' missing required 'recipe_id'.")
         try:
-            int(b.get("recipe_version", 1))
+            b_ver = int(b.get("recipe_version", 1))
             tw = Decimal(str(b.get("target_weight", "0")))
             tot_w = Decimal(str(b.get("total_weight", "0")))
             tot_c = Decimal(str(b.get("total_cost", "0")))
@@ -236,6 +300,20 @@ def inspect_workspace_file(file_path: str | Path) -> dict[str, Any]:
                 raise ValueError("Batch metrics must be finite numbers.")
         except (InvalidOperation, ValueError, TypeError) as err:
             raise ValueError(f"Batch '{batch_num}' contains invalid numeric metrics: {err}") from err
+
+        if revisions and (b_rec_id, b_ver) not in seen_revisions:
+            raise ValueError(
+                f"Batch '{batch_num}' references non-existent recipe revision "
+                f"(recipe_id='{b_rec_id}', version={b_ver})."
+            )
+
+        raw_items_json = b.get("items_json", "[]")
+        try:
+            parsed_items = json.loads(raw_items_json)
+            if not isinstance(parsed_items, list):
+                raise ValueError("items_json must be a JSON array")
+        except Exception as items_err:
+            raise ValueError(f"Batch '{batch_num}' contains malformed items_json: {items_err}") from items_err
 
     archived_count = sum(1 for r in recipes if isinstance(r, dict) and r.get("is_archived", 0) == 1)
 
@@ -297,8 +375,19 @@ def export_catalog_to_json_file(
     serialized = json.dumps(payload, indent=indent, ensure_ascii=False)
     staging_path = dest_path.parent / f".tmp_{dest_path.name}_{uuid.uuid4().hex[:8]}"
     try:
-        staging_path.write_text(serialized, encoding="utf-8")
+        with open(staging_path, "w", encoding="utf-8") as f:
+            f.write(serialized)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(str(staging_path), str(dest_path))
+        try:
+            dir_fd = os.open(str(dest_path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
     finally:
         if staging_path.exists():
             try:

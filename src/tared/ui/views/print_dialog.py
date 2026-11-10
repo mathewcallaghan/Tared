@@ -31,6 +31,7 @@ from tared.storage.base import (
     RecipeRepository,
     StorageError,
 )
+from tared.storage.workspace_io import export_workspace_to_json_file
 
 
 class PrintBatchSheetDialog(QDialog):
@@ -243,6 +244,19 @@ class PrintBatchSheetDialog(QDialog):
                     notes=notes_content,
                     created_at=export_utc_str,
                 )
+                if (
+                    self.config is not None
+                    and self.config.is_backup_configured()
+                    and not getattr(self.repo, "_is_memory", False)
+                ):
+                    try:
+                        target_backup = Path(self.config.auto_backup_dir) / "tared_workspace.json"
+                        export_workspace_to_json_file(self.repo, target_backup, max_rotations=3)
+                        self.config.record_backup_result(True)
+                    except Exception as bk_err:
+                        import logging
+                        logging.getLogger(__name__).warning("Auto backup on batch commit failed: %s", bk_err)
+                        self.config.record_backup_result(False, str(bk_err))
             db_committed = True
 
             # Invalidate cache since this batch number is now stored

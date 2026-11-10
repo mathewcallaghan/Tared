@@ -328,6 +328,28 @@ class TestSQLiteRecipeRepository(unittest.TestCase):
         self.assertEqual(len(self.repo.list_batches()), 0)
         self.assertEqual(len(self.repo.list_all_revisions()), 0)
 
+    def test_get_corrupted_recipes_discovers_empty_and_invalid_formulas(self) -> None:
+        self.repo.save_recipe(self.recipe)
+        conn = self.repo._get_connection()
+        conn.execute(
+            "INSERT INTO recipes (id, name, version, updated_at, is_archived) "
+            "VALUES ('empty-rec-1', 'Empty Shell Formula', 1, '', 0);"
+        )
+        conn.execute(
+            "INSERT INTO recipes (id, name, version, updated_at, is_archived) "
+            "VALUES ('bad-ing-1', 'Corrupt Ingredient Formula', 1, '', 0);"
+        )
+        conn.execute(
+            "INSERT INTO ingredients (recipe_id, sort_order, name, percentage, cost_per_unit) "
+            "VALUES ('bad-ing-1', 0, 'Bad Ing', '-5.00', '1.00');"
+        )
+
+        corrupt_items = self.repo.get_corrupted_recipes()
+        self.assertEqual(len(corrupt_items), 2)
+        names = {item["name"] for item in corrupt_items}
+        self.assertIn("Empty Shell Formula", names)
+        self.assertIn("Corrupt Ingredient Formula", names)
+
     def test_list_recipes_isolates_corrupted_recipe_without_raising(self) -> None:
         self.repo.save_recipe(self.recipe)
         conn = self.repo._get_connection()
@@ -379,6 +401,24 @@ class TestSQLiteRecipeRepository(unittest.TestCase):
         deleted = self.repo.delete_catalog_ingredient(catalog[0].id)
         self.assertTrue(deleted)
         self.assertIsNone(self.repo.get_catalog_ingredient("White Sugar"))
+
+    def test_save_catalog_ingredients_resolves_id_collision_on_renamed_import(self) -> None:
+        item = CatalogIngredient(id='colliding-id-01', name='Sugar', cost_per_unit=Decimal('1.25'))
+        self.repo.save_catalog_ingredient(item)
+
+        renamed = CatalogIngredient(id='colliding-id-01', name='White Sugar', cost_per_unit=Decimal('1.30'))
+        self.repo.update_catalog_ingredient(renamed)
+
+        old_item = CatalogIngredient(id='colliding-id-01', name='Sugar', cost_per_unit=Decimal('1.25'))
+        self.repo.save_catalog_ingredients([old_item])
+
+        catalog = self.repo.list_catalog_ingredients()
+        self.assertEqual(len(catalog), 2)
+        names = {c.name for c in catalog}
+        self.assertIn('White Sugar', names)
+        self.assertIn('Sugar', names)
+        ids = {c.id for c in catalog}
+        self.assertEqual(len(ids), 2)
 
     def test_record_batch_strips_batch_number_and_rejects_empty(self) -> None:
         self.repo.save_recipe(self.recipe)

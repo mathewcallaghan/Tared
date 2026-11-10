@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import QUrl
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtGui import QCloseEvent, QDesktopServices
 from PyQt6.QtWidgets import (
     QDialog,
     QFrame,
@@ -56,7 +56,6 @@ class UpdateDialog(QDialog):
         layout.setSpacing(12)
         layout.setContentsMargins(18, 18, 18, 18)
 
-        # Header status box
         header_card = QFrame()
         header_card.setStyleSheet(
             "background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 8px;"
@@ -72,7 +71,6 @@ class UpdateDialog(QDialog):
         header_layout.addWidget(self.status_subtitle)
         layout.addWidget(header_card)
 
-        # Release Notes / Description
         notes_label = QLabel("Release Notes:")
         notes_label.setStyleSheet("font-weight: bold; margin-top: 4px;")
         layout.addWidget(notes_label)
@@ -82,14 +80,12 @@ class UpdateDialog(QDialog):
         self.notes_browser.setPlaceholderText("Release notes will appear here once retrieved.")
         layout.addWidget(self.notes_browser)
 
-        # Progress bar (hidden until download starts)
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
 
-        # Action Buttons
         btn_layout = QHBoxLayout()
         self.btn_action = QPushButton("Check Again")
         self.btn_web = QPushButton("View on GitHub")
@@ -104,7 +100,6 @@ class UpdateDialog(QDialog):
         btn_layout.addWidget(self.btn_close)
         layout.addLayout(btn_layout)
 
-        # Connections
         self.btn_action.clicked.connect(self._on_action_clicked)
         self.btn_web.clicked.connect(self._open_web_releases)
         self.btn_close.clicked.connect(self._on_close_clicked)
@@ -116,6 +111,7 @@ class UpdateDialog(QDialog):
 
         self._check_worker = CheckUpdateWorker(self._current_version, self)
         self._check_worker.check_finished.connect(self._on_check_finished)
+        self._check_worker.finished.connect(self._check_worker.deleteLater)
         self._check_worker.start()
 
     def _on_check_finished(self, is_available: bool, info: UpdateInfo | None, message: str) -> None:
@@ -130,10 +126,12 @@ class UpdateDialog(QDialog):
             return
 
         self._update_info = info
-        self.status_title.setText(f"Update Available: v{info.version}")
+        auth_badge = " [Authentic ✓]" if info.is_signature_verified else ""
+        self.status_title.setText(f"Update Available: v{info.version}{auth_badge}")
         published_note = f" (Released: {info.published_at[:10]})" if info.published_at else ""
+        auth_note = " • Verified Ed25519 signature" if info.is_signature_verified else ""
         self.status_subtitle.setText(
-            f"Installed: v{self._current_version} → Available: {info.tag_name}{published_note}"
+            f"Installed: v{self._current_version} → Available: {info.tag_name}{published_note}{auth_note}"
         )
         self.notes_browser.setMarkdown(info.release_notes)
         self.btn_web.setVisible(True)
@@ -162,7 +160,6 @@ class UpdateDialog(QDialog):
             self._open_web_releases()
             return
 
-        # Start AppImage Download
         self.btn_action.setEnabled(False)
         self.btn_action.setText("Downloading...")
         self.progress_bar.setVisible(True)
@@ -172,6 +169,7 @@ class UpdateDialog(QDialog):
         self._download_worker.progress.connect(self._on_download_progress)
         self._download_worker.download_finished.connect(self._on_download_finished)
         self._download_worker.download_failed.connect(self._on_download_failed)
+        self._download_worker.finished.connect(self._download_worker.deleteLater)
         self._download_worker.start()
 
     def _on_download_progress(self, percent: int, bytes_read: int, total_bytes: int) -> None:
@@ -206,12 +204,17 @@ class UpdateDialog(QDialog):
         reply = QMessageBox.question(
             self,
             "Restart Application",
-            "Tared will now restart to finalize the update. Continue?",
+            "Tared will now close, save preferences, and restart to finalize the update. Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+
+        parent_window = self.parent()
+        if parent_window is not None and hasattr(parent_window, "close"):
+            if not parent_window.close():
+                return
 
         try:
             final_path = apply_appimage_update(
@@ -227,7 +230,28 @@ class UpdateDialog(QDialog):
     def _open_web_releases(self) -> None:
         QDesktopServices.openUrl(QUrl(RELEASES_WEB_URL))
 
+    def _cancel_active_workers(self) -> None:
+        try:
+            if self._download_worker and self._download_worker.isRunning():
+                self._download_worker.cancel()
+                self._download_worker.wait(1500)
+        except RuntimeError:
+            pass
+        try:
+            if self._check_worker and self._check_worker.isRunning():
+                self._check_worker.cancel()
+                self._check_worker.wait(1000)
+        except RuntimeError:
+            pass
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self._cancel_active_workers()
+        event.accept()
+
+    def reject(self) -> None:
+        self._cancel_active_workers()
+        super().reject()
+
     def _on_close_clicked(self) -> None:
-        if self._download_worker and self._download_worker.isRunning():
-            self._download_worker.cancel()
+        self._cancel_active_workers()
         self.accept()

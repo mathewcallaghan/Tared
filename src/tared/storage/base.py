@@ -121,6 +121,30 @@ class RecipeRepository(ABC):
     def list_all_revisions(self) -> list[dict[str, Any]]:
         """Retrieve all historical immutable revision snapshots across all recipes."""
 
+    def get_corrupted_recipes(self) -> list[dict[str, Any]]:
+        """Retrieve recipes from storage that fail integrity validation or lack ingredients."""
+        return []
+
+    def export_workspace_snapshot(self) -> dict[str, Any]:
+        """Atomically read all workspace entities within a single read transaction."""
+        return {
+            "catalog": [
+                {
+                    "id": item.id,
+                    "name": item.name,
+                    "cost_per_unit": str(item.cost_per_unit),
+                    "supplier": item.supplier,
+                    "sku": item.sku,
+                    "notes": item.notes,
+                    "updated_at": item.updated_at,
+                }
+                for item in self.list_catalog_ingredients()
+            ],
+            "recipes": self.list_all_recipes_data(),
+            "revisions": self.list_all_revisions(),
+            "batches": self.list_batches(),
+        }
+
     @abstractmethod
     def reset_workspace_data(
         self,

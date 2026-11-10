@@ -1,5 +1,6 @@
 """PyQt6 QAbstractTableModel adapting Recipe and BatchResult for real-time reactivity."""
 
+import decimal
 from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -50,6 +51,7 @@ except ImportError:
 
 
 from tared.core.calculator import (  # noqa: E402
+    CALCULATION_CONTEXT,
     IncompatibleTargetPrecisionError,
     PercentageSumError,
     RecipeCalculationError,
@@ -59,17 +61,42 @@ from tared.core.formatting import determine_cost_precision, format_currency, for
 from tared.core.models import BatchResult, Ingredient, Recipe  # noqa: E402
 
 
-def _parse_decimal_input(value: Any) -> Decimal:
+def _parse_decimal_input(
+    value: Any,
+    convert_kg: bool = False,
+    allow_mass_units: bool = False,
+) -> Decimal:
     raw = str(value).strip().replace("%", "").replace("$", "").strip()
     if not raw:
         raise ValueError("Empty numeric input")
 
-    # Scientific notation fast-path
+    has_unit = False
+    is_kg = False
+    matched_suffix = ""
+    raw_lower = raw.lower()
+    if raw_lower.endswith("kg"):
+        matched_suffix = raw[-2:]
+        raw = raw[:-2].strip()
+        is_kg = True
+        has_unit = True
+    elif raw_lower.endswith("g"):
+        matched_suffix = raw[-1:]
+        raw = raw[:-1].strip()
+        has_unit = True
+
+    if has_unit and not (convert_kg or allow_mass_units):
+        raise ValueError(f"Mass unit suffix '{matched_suffix}' is not permitted for this field.")
+
+    if not raw:
+        raise ValueError("Empty numeric input")
+
     if any(c in raw for c in ("e", "E")) and not any(c in raw for c in (",", " ")):
         try:
             dec = Decimal(raw)
             if not dec.is_finite():
                 raise ValueError("Non-finite numeric input")
+            if is_kg and convert_kg:
+                dec = dec * Decimal("1000")
             return dec
         except Exception as err:
             raise ValueError(f"Malformed numeric format '{value}'") from err
@@ -140,6 +167,8 @@ def _parse_decimal_input(value: Any) -> Decimal:
         dec = Decimal(normalized)
         if not dec.is_finite():
             raise ValueError("Non-finite numeric input")
+        if is_kg and convert_kg:
+            dec = dec * Decimal("1000")
         return dec
     except Exception as err:
         raise ValueError(f"Malformed numeric format '{value}'") from err
@@ -231,7 +260,7 @@ class RecipeTableModel(QAbstractTableModel):
             return Qt.ItemFlag.NoItemFlags
 
         base_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
-        if index.column() in (0, 1, 2):
+        if index.column() in (0, 1, 2, 3):
             return base_flags | Qt.ItemFlag.ItemIsEditable
         return base_flags
 
@@ -250,9 +279,18 @@ class RecipeTableModel(QAbstractTableModel):
             if col == 0:
                 return item["name"]
             if col == 1:
-                return str(item["percentage"])
+                return format_percentage(item["percentage"])
             if col == 2:
                 return str(item["cost_per_unit"])
+            if col == 3:
+                if self._current_batch is not None and row < len(self._current_batch.items):
+                    return f"{self._current_batch.items[row].scaled_weight:.{self.precision_decimals}f}"
+                if item.get("weight") is not None and item["weight"] > Decimal("0"):
+                    return f"{item['weight']:.{self.precision_decimals}f}"
+                if item["percentage"] > Decimal("0"):
+                    raw_w = (item["percentage"] * self._target_weight) / Decimal("100")
+                    return f"{raw_w:.{self.precision_decimals}f}"
+                return "0.00"
             return None
 
         if role in (Qt.ItemDataRole.DisplayRole, 0):
@@ -272,6 +310,13 @@ class RecipeTableModel(QAbstractTableModel):
                 if col == 5:
                     return format_currency(b_item.cost, precision=self._cost_precision)
 
+            if col == 3:
+                if item.get("weight") is not None and item["weight"] > Decimal("0"):
+                    return f"{item['weight']:.{self.precision_decimals}f}"
+                if item["percentage"] > Decimal("0"):
+                    raw_w = (item["percentage"] * self._target_weight) / Decimal("100")
+                    return f"{raw_w:.{self.precision_decimals}f}"
+
             return "—"
 
         return None
@@ -282,6 +327,7 @@ class RecipeTableModel(QAbstractTableModel):
 
         row = index.row()
         col = index.column()
+        col_start = col
         col_end = col
 
         try:
@@ -291,24 +337,64 @@ class RecipeTableModel(QAbstractTableModel):
                     self.edit_rejected.emit("Ingredient name cannot be empty.")
                     return False
                 self._ingredients[row]["name"] = val_str
-                # If line item cost is unassigned (0.00), pre-populate from catalog price memory
                 if self._ingredients[row]["cost_per_unit"] == Decimal("0.00") and self._catalog_lookup:
                     default_cost = self._catalog_lookup(val_str)
                     if default_cost is not None and default_cost > Decimal("0"):
                         self._ingredients[row]["cost_per_unit"] = default_cost
-                        col_end = 2  # Signal view to refresh column 2 (Unit Cost) immediately
+                        col_end = 2
             elif col == 1:
-                val_dec = _parse_decimal_input(value)
+                raw_str = str(value).strip().replace("%", "").strip()
+                current_pct = self._ingredients[row]["percentage"]
+                if raw_str == format_percentage(current_pct) or raw_str == str(current_pct):
+                    return True
+                val_dec = _parse_decimal_input(value, convert_kg=False, allow_mass_units=False)
                 if val_dec < Decimal("0") or val_dec > Decimal("100.00"):
                     self.edit_rejected.emit(f"Percentage must be between 0.00% and 100.00% (got {val_dec}%).")
                     return False
-                self._ingredients[row]["percentage"] = val_dec
+                if val_dec == current_pct:
+                    return True
+                with decimal.localcontext(CALCULATION_CONTEXT):
+                    self._ingredients[row]["percentage"] = val_dec
+                    self._ingredients[row]["weight"] = (val_dec * self._target_weight) / Decimal("100")
+                col_end = 3
             elif col == 2:
-                val_dec = _parse_decimal_input(value)
+                raw_str = str(value).strip().replace("$", "").strip()
+                current_cost = self._ingredients[row]["cost_per_unit"]
+                if raw_str == str(current_cost):
+                    return True
+                val_dec = _parse_decimal_input(value, convert_kg=False, allow_mass_units=False)
                 if val_dec < Decimal("0"):
                     self.edit_rejected.emit(f"Unit cost cannot be negative (got {val_dec}).")
                     return False
+                if val_dec == current_cost:
+                    return True
                 self._ingredients[row]["cost_per_unit"] = val_dec
+            elif col == 3:
+                val_dec = _parse_decimal_input(value, convert_kg=True, allow_mass_units=True)
+                if val_dec < Decimal("0"):
+                    self.edit_rejected.emit(f"Weight cannot be negative (got {val_dec} g).")
+                    return False
+                if self._target_weight <= Decimal("0"):
+                    self.edit_rejected.emit("Target batch mass must be greater than 0.")
+                    return False
+                if val_dec > self._target_weight:
+                    self.edit_rejected.emit(
+                        f"Weight ({val_dec} g) exceeds Target Batch Mass ({self._target_weight} g). "
+                        f"Increase Target Batch Mass first or use 'Batch by Weight...'."
+                    )
+                    return False
+                quot = val_dec / self._precision
+                if quot != quot.to_integral_value():
+                    self.edit_rejected.emit(
+                        f"Weight ({val_dec} g) must be an exact multiple of scale precision ({self._precision} g)."
+                    )
+                    return False
+                with decimal.localcontext(CALCULATION_CONTEXT):
+                    self._ingredients[row]["weight"] = val_dec
+                    computed_pct = (val_dec / self._target_weight) * Decimal("100")
+                    self._ingredients[row]["percentage"] = computed_pct
+                col_start = 1
+                col_end = 3
             else:
                 return False
         except (InvalidOperation, ValueError) as err:
@@ -316,7 +402,11 @@ class RecipeTableModel(QAbstractTableModel):
             self.edit_rejected.emit(f"Invalid input '{value}' for {col_name}: {err}")
             return False
 
-        self.dataChanged.emit(index, self.index(row, col_end), [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole])
+        self.dataChanged.emit(
+            self.index(row, col_start),
+            self.index(row, col_end),
+            [Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole],
+        )
         self.recalculate()
         return True
 
@@ -351,6 +441,7 @@ class RecipeTableModel(QAbstractTableModel):
                 "name": ing.name,
                 "percentage": ing.percentage,
                 "cost_per_unit": ing.cost_per_unit,
+                "weight": (ing.percentage * self._target_weight) / Decimal("100"),
                 "original_order": idx,
             }
             for idx, ing in enumerate(recipe.ingredients)
@@ -358,6 +449,43 @@ class RecipeTableModel(QAbstractTableModel):
         self._next_original_order = len(recipe.ingredients)
         if auto_sort:
             self._ingredients.sort(key=lambda x: x["percentage"], reverse=True)
+        self.endResetModel()
+        self.recalculate()
+
+    def set_ingredients_from_weights(
+        self,
+        items: list[dict[str, Any]],
+        target_weight: Decimal | None = None,
+    ) -> None:
+        """Set ingredients and calculate exact formula percentages from discrete ingredient weights."""
+        if target_weight is not None and target_weight > Decimal("0"):
+            self._target_weight = target_weight
+
+        total_weight = sum((Decimal(str(it["weight"])) for it in items), Decimal("0"))
+        if total_weight <= Decimal("0"):
+            raise ValueError("Total weight of ingredients must be greater than 0.")
+
+        self.beginResetModel()
+        self._ingredients = []
+        with decimal.localcontext(CALCULATION_CONTEXT):
+            for idx, it in enumerate(items):
+                w = Decimal(str(it["weight"]))
+                has_pct = "percentage" in it and it["percentage"] is not None
+                if has_pct and Decimal(str(it["percentage"])) > Decimal("0"):
+                    pct = Decimal(str(it["percentage"]))
+                else:
+                    pct = (w / total_weight) * Decimal("100")
+                cost = Decimal(str(it.get("cost_per_unit", "0.00")))
+                self._ingredients.append(
+                    {
+                        "name": str(it["name"]).strip(),
+                        "percentage": pct,
+                        "cost_per_unit": cost,
+                        "weight": w,
+                        "original_order": idx,
+                    }
+                )
+        self._next_original_order = len(self._ingredients)
         self.endResetModel()
         self.recalculate()
 
@@ -434,6 +562,8 @@ class RecipeTableModel(QAbstractTableModel):
     def set_target_weight(self, weight: Decimal) -> None:
         if weight != self._target_weight and weight > Decimal("0"):
             self._target_weight = weight
+            for item in self._ingredients:
+                item["weight"] = (item["percentage"] * self._target_weight) / Decimal("100")
             self.recalculate()
 
     def set_precision(self, precision: Decimal) -> None:
@@ -446,16 +576,24 @@ class RecipeTableModel(QAbstractTableModel):
         name: str = "New Ingredient",
         percentage: Decimal = Decimal("0.00"),
         cost_per_unit: Decimal = Decimal("0.00"),
+        weight: Decimal | None = None,
     ) -> None:
         row_pos = len(self._ingredients)
         next_order = self._next_original_order
         self._next_original_order += 1
+        if weight is None:
+            weight = (
+                (percentage * self._target_weight) / Decimal("100")
+                if percentage > Decimal("0")
+                else Decimal("0.00")
+            )
         self.beginInsertRows(QModelIndex(), row_pos, row_pos)
         self._ingredients.append(
             {
                 "name": name,
                 "percentage": percentage,
                 "cost_per_unit": cost_per_unit,
+                "weight": weight,
                 "original_order": next_order,
             }
         )
@@ -478,7 +616,9 @@ class RecipeTableModel(QAbstractTableModel):
         self._notify_derived_data_changed()
 
     def recalculate(self) -> None:
-        total_pct = sum((item["percentage"] for item in self._ingredients), Decimal("0"))
+        with decimal.localcontext(CALCULATION_CONTEXT):
+            total_pct = sum((item["percentage"] for item in self._ingredients), Decimal("0"))
+
         if not self._ingredients:
             self._set_invalid_state("Formula is empty. Add ingredients to begin.")
             return
@@ -486,6 +626,14 @@ class RecipeTableModel(QAbstractTableModel):
         if any(not item["name"].strip() for item in self._ingredients):
             self._set_invalid_state("Formula contains ingredients with empty names")
             return
+
+        seen_names = set()
+        for item in self._ingredients:
+            k = item["name"].strip().lower()
+            if k in seen_names:
+                self._set_invalid_state(f"Formula contains duplicate ingredient: '{item['name'].strip()}'")
+                return
+            seen_names.add(k)
 
         if any(item["percentage"] <= Decimal("0") for item in self._ingredients):
             self._set_invalid_state(f"Formula Total: {total_pct:.2f}% (Ingredients must be > 0.00%)")
@@ -498,7 +646,7 @@ class RecipeTableModel(QAbstractTableModel):
             self._is_valid = True
             self._cost_precision = determine_cost_precision([item.cost for item in batch.items])
 
-            if total_pct == Decimal("100.00") or total_pct == Decimal("100"):
+            if abs(total_pct - Decimal("100.00")) <= Decimal("1e-9") or total_pct == Decimal("100"):
                 status_msg = "Formula Total: 100.00% (Valid)"
             else:
                 status_msg = f"Formula Total: {total_pct:.4f}% (Valid within tolerance)"

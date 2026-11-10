@@ -507,6 +507,74 @@ class SQLiteRecipeRepository(RecipeRepository):
             if not self._is_memory:
                 conn.close()
 
+    def get_corrupted_recipes(self) -> list[dict[str, Any]]:
+        """Identify active recipes that have no ingredients or invalid formulation data."""
+        conn = self._get_connection()
+        try:
+            recipe_rows = conn.execute(
+                "SELECT id, name, description, version, updated_at FROM recipes "
+                "WHERE is_archived = 0 ORDER BY name ASC;"
+            ).fetchall()
+
+            if not recipe_rows:
+                return []
+
+            ingredient_rows = conn.execute(
+                """
+                SELECT recipe_id, name, percentage, cost_per_unit
+                FROM ingredients
+                WHERE recipe_id IN (SELECT id FROM recipes WHERE is_archived = 0)
+                ORDER BY recipe_id, sort_order ASC;
+                """
+            ).fetchall()
+
+            raw_ingredients_by_recipe: dict[str, list[dict[str, Any]]] = {}
+            for row in ingredient_rows:
+                r_id = row["recipe_id"]
+                if r_id not in raw_ingredients_by_recipe:
+                    raw_ingredients_by_recipe[r_id] = []
+                raw_ingredients_by_recipe[r_id].append(row)
+
+            corrupted: list[dict[str, Any]] = []
+            for r_row in recipe_rows:
+                r_id = r_row["id"]
+                raw_ings = raw_ingredients_by_recipe.get(r_id, [])
+                if not raw_ings:
+                    corrupted.append({
+                        "id": r_id,
+                        "name": r_row["name"],
+                        "error": "Recipe contains no ingredients",
+                    })
+                    continue
+                try:
+                    ings = tuple(
+                        Ingredient(
+                            name=row["name"],
+                            percentage=Decimal(row["percentage"]),
+                            cost_per_unit=Decimal(row["cost_per_unit"]),
+                        )
+                        for row in raw_ings
+                    )
+                    Recipe(
+                        id=r_id,
+                        name=r_row["name"],
+                        description=r_row["description"],
+                        version=int(r_row["version"]),
+                        updated_at=r_row["updated_at"],
+                        ingredients=ings,
+                    )
+                except Exception as err:
+                    corrupted.append({
+                        "id": r_id,
+                        "name": r_row["name"],
+                        "error": str(err),
+                    })
+
+            return corrupted
+        finally:
+            if not self._is_memory:
+                conn.close()
+
     def list_recipes(self) -> list[Recipe]:
         conn = self._get_connection()
         try:
@@ -661,6 +729,38 @@ class SQLiteRecipeRepository(RecipeRepository):
         conn = self._get_connection()
         try:
             with conn:
+                existing_rows = conn.execute(
+                    "SELECT id, name FROM ingredients_catalog;"
+                ).fetchall()
+                existing_by_name = {row["name"].strip().lower(): row["id"] for row in existing_rows}
+                existing_ids = {row["id"] for row in existing_rows}
+
+                records = []
+                for item in items:
+                    clean_name = item.name.strip()
+                    lower_name = clean_name.lower()
+                    if lower_name in existing_by_name:
+                        resolved_id = existing_by_name[lower_name]
+                    else:
+                        if item.id in existing_ids:
+                            resolved_id = str(uuid.uuid4())
+                        else:
+                            resolved_id = item.id
+                        existing_ids.add(resolved_id)
+                        existing_by_name[lower_name] = resolved_id
+
+                    records.append(
+                        (
+                            resolved_id,
+                            clean_name,
+                            str(item.cost_per_unit),
+                            item.supplier.strip(),
+                            item.sku.strip(),
+                            item.notes.strip(),
+                            item.updated_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        )
+                    )
+
                 conn.executemany(
                     """
                     INSERT INTO ingredients_catalog (id, name, cost_per_unit, supplier, sku, notes, updated_at)
@@ -673,18 +773,7 @@ class SQLiteRecipeRepository(RecipeRepository):
                         notes = CASE WHEN excluded.notes != '' THEN excluded.notes ELSE ingredients_catalog.notes END,
                         updated_at = excluded.updated_at;
                     """,
-                    [
-                        (
-                            item.id,
-                            item.name.strip(),
-                            str(item.cost_per_unit),
-                            item.supplier.strip(),
-                            item.sku.strip(),
-                            item.notes.strip(),
-                            item.updated_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        )
-                        for item in items
-                    ],
+                    records,
                 )
         finally:
             if not self._is_memory:
@@ -819,6 +908,89 @@ class SQLiteRecipeRepository(RecipeRepository):
                     }
                 )
             return result
+        finally:
+            if not self._is_memory:
+                conn.close()
+
+    def export_workspace_snapshot(self) -> dict[str, Any]:
+        """Atomically read all workspace entities within a single read connection and transaction."""
+        conn = self._get_connection()
+        try:
+            with conn:
+                cat_rows = conn.execute(
+                    "SELECT id, name, cost_per_unit, supplier, sku, notes, updated_at "
+                    "FROM ingredients_catalog ORDER BY name COLLATE NOCASE ASC;"
+                ).fetchall()
+                catalog = [
+                    {
+                        "id": row["id"],
+                        "name": row["name"],
+                        "cost_per_unit": str(Decimal(row["cost_per_unit"])),
+                        "supplier": row["supplier"],
+                        "sku": row["sku"],
+                        "notes": row["notes"],
+                        "updated_at": row["updated_at"],
+                    }
+                    for row in cat_rows
+                ]
+
+                recipe_rows = conn.execute(
+                    "SELECT id, name, description, version, updated_at, is_archived "
+                    "FROM recipes ORDER BY name ASC;"
+                ).fetchall()
+
+                ingredient_rows = conn.execute(
+                    "SELECT recipe_id, sort_order, name, percentage, cost_per_unit "
+                    "FROM ingredients ORDER BY recipe_id, sort_order ASC;"
+                ).fetchall()
+
+                ingredients_by_recipe: dict[str, list[dict[str, str]]] = {}
+                for row in ingredient_rows:
+                    r_id = row["recipe_id"]
+                    if r_id not in ingredients_by_recipe:
+                        ingredients_by_recipe[r_id] = []
+                    ingredients_by_recipe[r_id].append(
+                        {
+                            "name": row["name"],
+                            "percentage": str(row["percentage"]),
+                            "cost_per_unit": str(row["cost_per_unit"]),
+                        }
+                    )
+
+                recipes = []
+                for r_row in recipe_rows:
+                    r_id = r_row["id"]
+                    recipes.append(
+                        {
+                            "id": r_id,
+                            "name": r_row["name"],
+                            "description": r_row["description"],
+                            "version": int(r_row["version"]),
+                            "updated_at": r_row["updated_at"],
+                            "is_archived": int(r_row["is_archived"]),
+                            "ingredients": ingredients_by_recipe.get(r_id, []),
+                        }
+                    )
+
+                rev_rows = conn.execute(
+                    "SELECT id, recipe_id, version, name, description, ingredients_json, created_at "
+                    "FROM recipe_revisions ORDER BY recipe_id, version ASC;"
+                ).fetchall()
+                revisions = [dict(row) for row in rev_rows]
+
+                batch_rows = conn.execute(
+                    "SELECT id, recipe_id, recipe_version, batch_number, operator, precision, "
+                    "target_weight, total_weight, total_cost, items_json, notes, created_at "
+                    "FROM batches ORDER BY created_at DESC;"
+                ).fetchall()
+                batches = [dict(row) for row in batch_rows]
+
+                return {
+                    "catalog": catalog,
+                    "recipes": recipes,
+                    "revisions": revisions,
+                    "batches": batches,
+                }
         finally:
             if not self._is_memory:
                 conn.close()
@@ -1095,13 +1267,12 @@ class SQLiteRecipeRepository(RecipeRepository):
         conn = self._get_connection()
         try:
             conn.execute("PRAGMA foreign_keys = OFF;")
-            conn.executescript("""
-                DROP TABLE IF EXISTS batches;
-                DROP TABLE IF EXISTS recipe_revisions;
-                DROP TABLE IF EXISTS ingredients;
-                DROP TABLE IF EXISTS recipes;
-                DROP TABLE IF EXISTS ingredients_catalog;
-            """)
+            with conn:
+                conn.execute("DROP TABLE IF EXISTS batches;")
+                conn.execute("DROP TABLE IF EXISTS recipe_revisions;")
+                conn.execute("DROP TABLE IF EXISTS ingredients;")
+                conn.execute("DROP TABLE IF EXISTS recipes;")
+                conn.execute("DROP TABLE IF EXISTS ingredients_catalog;")
         finally:
             if not self._is_memory:
                 conn.close()

@@ -43,8 +43,11 @@ When scaling a formula to a target mass $M$ at scale precision $Q$:
    - Earliest formula index (tie-breaker 2).
 6. **Cost Valuation:** Unit costs are denominated in $/kg. Line and batch costs are calculated directly from raw scaled grams: $\text{Cost} = (w_{\text{scaled}} \times \text{Cost}_{\text{per kg}}) / 1000$. Line items display adaptive precision (2 or 4 decimal places), while total cost is rounded from unrounded sum accumulation to prevent rounding drift.
 
+
+7. **Largest-Remainder Non-Monotonicity (Alabama Paradox):** Like all largest-remainder discrete allocation algorithms, Hare-Niemeyer allocation is quota-consistent but not strictly population-monotonic. In rare edge conditions at allocation boundaries, scaling a target batch mass up by a single precision quantum can cause an individual component's allocation to decrease by one quantum due to dynamic shifts in fractional remainder ranks.
+
 ### 2. Draft Lifecycle & Revision Archival Semantics
-- **Immutable Revision Progression:** Under Tared's audit model, calling **Save Formula** on any recipe that alters formula name, compounding instructions, ingredient order, percentages, or unit costs generates an immutable snapshot in `recipe_revisions` and increments the recipe version ($v1 	o v2 	o v3$).
+- **Immutable Revision Progression:** Under Tared's audit model, calling **Save Formula** on any recipe that alters formula name, compounding instructions, ingredient order, percentages, or unit costs generates an immutable snapshot in `recipe_revisions` and increments the recipe version ($v1 \to v2 \to v3$).
 - **In-Progress Drafts:** Formulations that do not yet sum to 100.00% may be saved as drafts with user confirmation. Each save event records an immutable revision snapshot, ensuring work-in-progress can be audited or restored from workspace backups.
 - **Production Gate:** Batch sheet printing and PDF generation remain strictly locked until formula percentages sum to 100.00% ($\pm 0.0001\%$).
 
