@@ -80,6 +80,7 @@ SELF=$(readlink -f "$0")
 HERE=${SELF%/*}
 export PATH="${HERE}/usr/bin:${PATH}"
 export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH}"
+export QT_QPA_PLATFORM="xcb"
 exec "${HERE}/usr/bin/tared" "$@"
 RUNNER
 chmod +x "${APP_DIR}/AppRun"

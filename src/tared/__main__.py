@@ -1,6 +1,7 @@
 """Desktop application entry point with persistent error file logging and CLI handling."""
 
 import argparse
+import os
 import sys
 import traceback
 from datetime import datetime
@@ -30,17 +31,24 @@ def global_exception_hook(exctype, value, tb) -> None:
         except Exception:
             pass
 
-    from PyQt6.QtWidgets import QApplication, QMessageBox
+    try:
+        from PyQt6.QtWidgets import QApplication, QMessageBox
 
-    app = QApplication.instance()
-    if app is not None:
-        msg = QMessageBox()
-        msg.setIcon(QMessageBox.Icon.Critical)
-        msg.setWindowTitle("Unexpected Application Error")
-        msg.setText("An unexpected application error occurred.")
-        msg.setInformativeText(str(value))
-        msg.setDetailedText(trace_msg)
-        msg.exec()
+        app = QApplication.instance()
+        if app is not None:
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Icon.Critical)
+            msg.setWindowTitle("Unexpected Application Error")
+            msg.setText("An unexpected application error occurred.")
+            msg.setInformativeText(str(value))
+            msg.setDetailedText(trace_msg)
+            msg.exec()
+    except Exception as e:
+        if sys.__stderr__ is not None:
+            try:
+                sys.__stderr__.write(f"\nError displaying crash dialog: {e}\n")
+            except Exception:
+                pass
 
 
 def parse_cli_args() -> None:
@@ -58,7 +66,6 @@ def parse_cli_args() -> None:
         version=f"%(prog)s {version_str}",
     )
 
-    # Intercept help and version flags without triggering GUI subsystems
     if any(arg in sys.argv[1:] for arg in ("-h", "--help", "-v", "--version")):
         parser.parse_args()
 
@@ -66,13 +73,17 @@ def parse_cli_args() -> None:
 def main() -> None:
     global LOG_FILE
 
+    # Force XCB on Linux to prevent Qt6 Wayland client crashes with unmapped Fn/Media keys
+    if sys.platform.startswith("linux"):
+        os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
+
     parse_cli_args()
 
     from PyQt6.QtWidgets import QApplication
 
     app = QApplication(sys.argv)
-    app.setApplicationName("tared")
-    app.setApplicationDisplayName("")
+    app.setApplicationName("Tared")
+    app.setApplicationDisplayName("Tared")
 
     data_dir = Path.home() / ".local" / "share" / "tared"
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -90,6 +101,11 @@ def main() -> None:
                 import shutil
 
                 shutil.copy2(str(legacy_db), str(db_path))
+                for suffix in ("-wal", "-shm"):
+                    legacy_aux = legacy_db.with_name(legacy_db.name + suffix)
+                    if legacy_aux.is_file():
+                        shutil.copy2(str(legacy_aux), str(db_path.with_name(db_path.name + suffix)))
+
                 if sys.__stderr__ is not None:
                     sys.__stderr__.write(
                         f"Notice: Migrated legacy formulation database from {legacy_db} to {db_path}\n"
