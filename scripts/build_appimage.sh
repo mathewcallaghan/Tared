@@ -61,6 +61,14 @@ mkdir -p "${APP_DIR}/usr/share/icons/hicolor/scalable/apps"
 mkdir -p "${APP_DIR}/assets"
 
 cp -r dist/tared/* "${APP_DIR}/usr/bin/"
+
+# Copy both libxkbcommon and libxkbcommon-x11 into usr/lib to guarantee zero split-pair mismatch
+for xkb_lib in /usr/lib/x86_64-linux-gnu/libxkbcommon*.so*; do
+    if [ -f "${xkb_lib}" ]; then
+        cp -d "${xkb_lib}" "${APP_DIR}/usr/lib/" 2>/dev/null || true
+    fi
+done
+
 cp "${PKG_ASSETS}/tared.desktop" "${APP_DIR}/tared.desktop"
 cp "${PKG_ASSETS}/tared.desktop" "${APP_DIR}/usr/share/applications/"
 cp "${PKG_ASSETS}/tared.png" "${APP_DIR}/tared.png"
@@ -79,8 +87,12 @@ cat << 'RUNNER' > "${APP_DIR}/AppRun"
 SELF=$(readlink -f "$0")
 HERE=${SELF%/*}
 export PATH="${HERE}/usr/bin:${PATH}"
-export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH}"
-export QT_QPA_PLATFORM="xcb"
+export LD_LIBRARY_PATH="${HERE}/usr/lib:${HERE}/usr/bin/_internal:${HERE}/usr/bin:${LD_LIBRARY_PATH}"
+export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
+export QT_IM_MODULE="${QT_IM_MODULE:-compose}"
+export XMODIFIERS="${XMODIFIERS:-@im=none}"
+export GIO_MODULE_DIR=""
+export GIO_EXTRA_MODULES=""
 exec "${HERE}/usr/bin/tared" "$@"
 RUNNER
 chmod +x "${APP_DIR}/AppRun"
@@ -92,7 +104,6 @@ RUNTIME_PATH="${BUILD_DIR}/runtime-${ARCH}"
 
 mkdir -p "${BUILD_DIR}"
 
-# Check ~/Downloads if user manually downloaded runtime
 if [ ! -f "${RUNTIME_PATH}" ] || [ ! -s "${RUNTIME_PATH}" ]; then
     for dl_candidate in "${HOME}/Downloads/runtime-${ARCH}" "${HOME}/Downloads/runtime"; do
         if [ -f "${dl_candidate}" ] && [ -s "${dl_candidate}" ]; then
