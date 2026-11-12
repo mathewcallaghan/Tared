@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release Tag (optional, defaults to v<version>)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -14,10 +19,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout source code
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@v4
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
@@ -51,10 +56,10 @@ jobs:
     needs: test
     steps:
       - name: Checkout source code
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        uses: actions/checkout@v4
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
@@ -87,9 +92,23 @@ jobs:
           sha256sum "${APPIMAGE_BIN}" > "${APPIMAGE_BIN}.sha256"
           sha256sum "${APPIMAGE_BIN}" > SHA256SUMS
 
+      - name: Determine Release Tag
+        id: release_tag
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            TAG="${{ github.ref_name }}"
+          elif [ -n "${{ inputs.tag_name }}" ]; then
+            TAG="${{ inputs.tag_name }}"
+          else
+            VERSION=$(python3 -c "import re, pathlib; content = pathlib.Path('src/tared/__init__.py').read_text(); print(re.search(r'__version__\s*=\s*[\"\'\']([^\"\'\']+)[\"\'\']', content).group(1))")
+            TAG="v${VERSION}"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.release_tag.outputs.tag }}
           files: |
             Tared-*.AppImage
             Tared-*.AppImage.sha256
