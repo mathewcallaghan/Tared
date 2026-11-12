@@ -1049,6 +1049,33 @@ class TestRecipeTableModelIntegration(unittest.TestCase):
         dialog.close()
         repo.close()
 
+    def test_table_model_valid_parent_returns_zero_dimensions(self) -> None:
+        idx = self.model.index(0, 0)
+        self.assertTrue(idx.isValid())
+        self.assertEqual(self.model.rowCount(idx), 0)
+        self.assertEqual(self.model.columnCount(idx), 0)
+        self.assertIsNone(self.model.data(self.model.index(0, 0, idx)))
+
+    def test_shift_key_press_and_range_selection_does_not_crash(self) -> None:
+        from PyQt6.QtCore import QEvent, QItemSelection, QItemSelectionModel
+        from PyQt6.QtGui import QKeyEvent
+
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        repo.save_recipe(self.recipe)
+        window = MainWindow(repo)
+        self.addCleanup(window.close)
+
+        key_event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Shift, Qt.KeyboardModifier.ShiftModifier)
+        window.table_view.keyPressEvent(key_event)
+
+        sel_model = window.table_view.selectionModel()
+        idx_start = window.table_model.index(0, 0)
+        idx_end = window.table_model.index(2, window.table_model.columnCount() - 1)
+        selection = QItemSelection(idx_start, idx_end)
+        sel_model.select(selection, QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+        self.assertEqual(len(sel_model.selectedRows()), 3)
+
 
 if __name__ == "__main__":
     unittest.main()

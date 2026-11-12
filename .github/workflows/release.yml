@@ -88,7 +88,7 @@ jobs:
           sha256sum "${APPIMAGE_BIN}" > SHA256SUMS
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@c062e49339243da650e6988898951b1a7741d803 # v2.2.1
+        uses: softprops/action-gh-release@v2
         with:
           files: |
             Tared-*.AppImage

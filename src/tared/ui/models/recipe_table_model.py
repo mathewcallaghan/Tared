@@ -244,9 +244,13 @@ class RecipeTableModel(QAbstractTableModel):
         return tuple(dict(item) for item in self._ingredients)
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        if parent is not None and parent.isValid():
+            return 0
         return len(self._ingredients)
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+        if parent is not None and parent.isValid():
+            return 0
         return len(COLUMNS)
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = 0) -> Any:
@@ -256,7 +260,7 @@ class RecipeTableModel(QAbstractTableModel):
         return None
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlag:
-        if not index.isValid():
+        if not index.isValid() or index.parent().isValid():
             return Qt.ItemFlag.NoItemFlags
 
         base_flags = Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
@@ -265,7 +269,9 @@ class RecipeTableModel(QAbstractTableModel):
         return base_flags
 
     def data(self, index: QModelIndex, role: int = 0) -> Any:
-        if not index.isValid() or not (0 <= index.row() < len(self._ingredients)):
+        if not index.isValid() or index.parent().isValid():
+            return None
+        if not (0 <= index.row() < len(self._ingredients)) or not (0 <= index.column() < len(COLUMNS)):
             return None
 
         row = index.row()
@@ -322,7 +328,9 @@ class RecipeTableModel(QAbstractTableModel):
         return None
 
     def setData(self, index: QModelIndex, value: Any, role: int = 2) -> bool:
-        if not index.isValid() or role not in (Qt.ItemDataRole.EditRole, 2):
+        if not index.isValid() or index.parent().isValid() or role not in (Qt.ItemDataRole.EditRole, 2):
+            return False
+        if not (0 <= index.row() < len(self._ingredients)) or not (0 <= index.column() < len(COLUMNS)):
             return False
 
         row = index.row()
