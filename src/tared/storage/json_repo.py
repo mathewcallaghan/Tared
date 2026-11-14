@@ -19,6 +19,7 @@ def recipe_to_dict(recipe: Recipe) -> dict[str, Any]:
         "description": recipe.description,
         "recipe_version": recipe.version,
         "updated_at": recipe.updated_at,
+        "is_draft": recipe.is_draft,
         "ingredients": [
             {
                 "name": ing.name,
@@ -75,6 +76,7 @@ def recipe_from_dict(data: dict[str, Any]) -> Recipe:
             description=str(data.get("description") or ""),
             version=int(data.get("recipe_version", 1)),
             updated_at=str(data.get("updated_at") or ""),
+            is_draft=bool(data.get("is_draft", False)),
             ingredients=tuple(parsed_ingredients),
         )
     except Exception as err:

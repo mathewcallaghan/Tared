@@ -325,6 +325,30 @@ class TestWorkspaceIO(unittest.TestCase):
             inspect_workspace_file(corrupt_file)
         self.assertIn('invalid numeric metrics', str(ctx.exception))
 
+    def test_workspace_roundtrip_preserves_explicit_draft_without_backfilling_revision(self) -> None:
+        from tared.core.models import Ingredient
+
+        draft_rec = Recipe(
+            id="rec-ws-draft",
+            name="Draft Only Formula",
+            version=1,
+            is_draft=True,
+            ingredients=(Ingredient("Base", Decimal("50.00")),),
+        )
+        self.repo.save_recipe(draft_rec)
+
+        backup_file = Path(self.temp_dir.name) / "with_draft.json"
+        export_workspace_to_json_file(self.repo, backup_file)
+
+        inspect_workspace_file(backup_file)
+        restore_workspace_from_json(self.repo, backup_file)
+
+        restored = self.repo.get_recipe("rec-ws-draft")
+        self.assertIsNotNone(restored)
+        assert restored is not None
+        self.assertTrue(restored.is_draft)
+        self.assertEqual(len(self.repo.get_recipe_revisions("rec-ws-draft")), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

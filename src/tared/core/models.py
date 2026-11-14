@@ -66,6 +66,7 @@ class Recipe:
     description: str = ""
     version: int = 1
     updated_at: str = ""
+    is_draft: bool = False
 
     def __post_init__(self) -> None:
         if not self.name.strip():
@@ -84,6 +85,8 @@ class Recipe:
             object.__setattr__(self, "id", str(uuid.uuid4()))
         if self.version < 1:
             object.__setattr__(self, "version", 1)
+        if not isinstance(self.is_draft, bool):
+            object.__setattr__(self, "is_draft", bool(self.is_draft))
 
 
 @dataclass(frozen=True, slots=True)

@@ -231,6 +231,7 @@ def inspect_workspace_file(file_path: str | Path) -> dict[str, Any]:
         raw_ings = r.get("ingredients", [])
         if not isinstance(raw_ings, list) or not raw_ings:
             raise ValueError(f"Recipe '{r_name}' must contain at least one ingredient.")
+        r_is_draft = bool(r.get("is_draft", 0))
         try:
             parsed_ings = tuple(
                 Ingredient(
@@ -245,6 +246,7 @@ def inspect_workspace_file(file_path: str | Path) -> dict[str, Any]:
                 name=r_name,
                 description=str(r.get("description", "")),
                 version=r_ver,
+                is_draft=r_is_draft,
                 ingredients=parsed_ings,
             )
         except Exception as err:
@@ -252,6 +254,11 @@ def inspect_workspace_file(file_path: str | Path) -> dict[str, Any]:
 
         # Assert parity with revision snapshot at same (id, version) when revisions exist
         rev_key = (r_id, r_ver)
+        if r_is_draft and rev_key in revisions_map:
+            raise ValueError(
+                f"Integrity violation in backup: Draft recipe '{r_name}' (id='{r_id}', v{r_ver}) "
+                f"conflicts with an immutable revision snapshot at v{r_ver}."
+            )
         if rev_key in revisions_map:
             rev_ings = revisions_map[rev_key]
             if len(rec.ingredients) != len(rev_ings):

@@ -107,10 +107,19 @@ class RecipeService:
     repository: RecipeRepository
 
     def compute_next_version(self, candidate: Recipe) -> int:
-        """Determine next recipe version based on formulation composition changes."""
+        """Determine next recipe version based on draft state and formulation changes."""
         existing = self.repository.get_recipe(candidate.id, include_archived=True)
         if existing is None:
             return 1
+
+        # Drafts stay on their target version across repeated edits and on finalization
+        if existing.is_draft:
+            return existing.version
+
+        # Branching a draft from a finalized revision reserves the next version number
+        if candidate.is_draft:
+            return existing.version + 1
+
         if has_formulation_changed(existing, candidate):
             return existing.version + 1
 
@@ -152,6 +161,7 @@ class RecipeService:
             description=candidate.description,
             version=version,
             updated_at=timestamp,
+            is_draft=candidate.is_draft,
             ingredients=candidate.ingredients,
         )
 
@@ -160,6 +170,37 @@ class RecipeService:
         prepared = self.prepare_recipe_for_save(candidate, timestamp=timestamp)
         self.repository.save_recipe(prepared)
         return prepared
+
+    def discard_draft(self, recipe_id: str) -> Recipe | None:
+        """Revert an unreleased draft formula back to its latest committed revision snapshot."""
+        existing = self.repository.get_recipe(recipe_id, include_archived=True)
+        if existing is None or not existing.is_draft:
+            raise ValueError("Only an active draft formula can be discarded.")
+
+        revisions = self.repository.get_recipe_revisions(recipe_id)
+        if not revisions:
+            return None
+
+        latest_rev = revisions[0]
+        rev_items = json.loads(latest_rev["ingredients_json"])
+        reverted = Recipe(
+            id=recipe_id,
+            name=latest_rev["name"],
+            description=latest_rev.get("description", "") or "",
+            version=int(latest_rev["version"]),
+            updated_at=latest_rev.get("created_at", "") or "",
+            is_draft=False,
+            ingredients=tuple(
+                Ingredient(
+                    name=it["name"],
+                    percentage=Decimal(str(it["percentage"])),
+                    cost_per_unit=Decimal(str(it.get("cost_per_unit", "0.00"))),
+                )
+                for it in rev_items
+            ),
+        )
+        self.repository.save_recipe(reverted)
+        return reverted
 
     def get_catalog_price(self, ingredient_name: str) -> Decimal | None:
         """Retrieve master catalog unit cost for an ingredient name if known."""
@@ -192,6 +233,7 @@ class RecipeService:
             description=recipe.description,
             version=recipe.version,
             updated_at=recipe.updated_at,
+            is_draft=recipe.is_draft,
             ingredients=tuple(new_ingredients),
         )
         return updated_recipe, changes
@@ -327,6 +369,7 @@ class RecipeService:
                     description=candidate.description,
                     version=1,
                     updated_at=timestamp,
+                    is_draft=candidate.is_draft,
                     ingredients=candidate.ingredients,
                 )
             if collision_mode == "overwrite":
@@ -337,6 +380,7 @@ class RecipeService:
                     description=candidate.description,
                     version=next_ver,
                     updated_at=timestamp,
+                    is_draft=candidate.is_draft,
                     ingredients=candidate.ingredients,
                 )
             raise ValueError(
@@ -349,6 +393,7 @@ class RecipeService:
             description=candidate.description,
             version=1,
             updated_at=timestamp,
+            is_draft=candidate.is_draft,
             ingredients=candidate.ingredients,
         )
 

@@ -347,6 +347,13 @@ class MainWindow(QMainWindow):
 
         btn_box = QHBoxLayout()
         btn_box.setSpacing(8)
+        self.btn_save_draft = QPushButton("Save as Draft")
+        self.btn_save_draft.setToolTip("Save changes in Draft mode without bumping the revision number")
+        self.btn_save_draft.setStyleSheet("padding: 6px 12px;")
+        self.btn_discard_draft = QPushButton("Discard Draft")
+        self.btn_discard_draft.setToolTip("Discard unreleased draft changes and revert to the last finalized revision")
+        self.btn_discard_draft.setStyleSheet("padding: 6px 12px;")
+        self.btn_discard_draft.setVisible(False)
         self.btn_save = QPushButton("Save Formula")
         self.btn_save.setStyleSheet("font-weight: bold; padding: 6px 14px;")
         self.btn_print = QPushButton("Print Batch Sheet...")
@@ -354,6 +361,8 @@ class MainWindow(QMainWindow):
         self.btn_history = QPushButton("History...")
         self.btn_history.setToolTip("View production batch logs and saved formula revisions")
         self.btn_history.setStyleSheet("padding: 6px 14px;")
+        btn_box.addWidget(self.btn_discard_draft)
+        btn_box.addWidget(self.btn_save_draft)
         btn_box.addWidget(self.btn_save)
         btn_box.addWidget(self.btn_print)
         btn_box.addWidget(self.btn_history)
@@ -369,7 +378,9 @@ class MainWindow(QMainWindow):
         self.btn_new.clicked.connect(self._create_new_recipe)
         self.btn_delete.clicked.connect(self._delete_current_recipe)
         self.btn_view_archive.clicked.connect(self._open_archive_dialog)
-        self.btn_save.clicked.connect(lambda: self._save_current_recipe())
+        self.btn_save_draft.clicked.connect(lambda: self._save_current_recipe(as_draft=True))
+        self.btn_discard_draft.clicked.connect(self._discard_current_draft)
+        self.btn_save.clicked.connect(lambda: self._save_current_recipe(as_draft=False))
         self.btn_import.clicked.connect(self._import_recipe)
         self.btn_export.clicked.connect(self._export_recipe)
         self.btn_catalog.clicked.connect(self._open_catalog_dialog)
@@ -507,7 +518,8 @@ class MainWindow(QMainWindow):
             selected_row = -1
 
             for idx, r in enumerate(recipes):
-                display_title = f"{r.name} (v{r.version})"
+                draft_suffix = " Draft" if r.is_draft else ""
+                display_title = f"{r.name} (v{r.version}{draft_suffix})"
                 item = QListWidgetItem(display_title)
                 item.setData(Qt.ItemDataRole.UserRole, r.id)
                 self.recipe_list.addItem(item)
@@ -599,11 +611,17 @@ class MainWindow(QMainWindow):
                 self.name_input.setText(recipe.name)
                 self.desc_input.setText(recipe.description)
                 updated_text = f" (Updated: {recipe.updated_at})" if recipe.updated_at else ""
-                self.rev_label.setText(f"Revision: v{recipe.version}{updated_text}")
+                if recipe.is_draft:
+                    self.rev_label.setText(
+                        f"Revision: v{recipe.version} (Draft — edits keep v{recipe.version}){updated_text}"
+                    )
+                else:
+                    self.rev_label.setText(f"Revision: v{recipe.version}{updated_text}")
 
                 self.sort_combo.setCurrentIndex(0)
                 self.table_model.load_recipe(recipe, auto_sort=False)
                 self._set_dirty(False)
+                self._update_draft_controls()
             finally:
                 self._is_switching_recipe = prev_switching
         elif hasattr(self.repo, "get_corrupted_recipes"):
@@ -625,6 +643,7 @@ class MainWindow(QMainWindow):
                         "padding: 4px 8px; border-radius: 4px;"
                     )
                     self._set_dirty(False)
+                    self._update_draft_controls()
                 finally:
                     self._is_switching_recipe = prev_switching
 
@@ -651,6 +670,7 @@ class MainWindow(QMainWindow):
             self.sort_combo.setCurrentIndex(0)
             self.table_model.new_draft(name="New Formulation", description="")
             self._set_dirty(False)
+            self._update_draft_controls()
         finally:
             self._is_switching_recipe = prev_switching
 
@@ -695,6 +715,8 @@ class MainWindow(QMainWindow):
 
         total_pct = sum((item["percentage"] for item in self.table_model.ingredients_data), Decimal("0"))
         if abs(total_pct - Decimal("100.00")) > Decimal("0.0001"):
+            if action_name == "save_draft":
+                return True
             if action_name == "save":
                 msg_lines = [
                     f"Formula percentages sum to {total_pct:.2f}% (not 100.00%).",
@@ -723,12 +745,36 @@ class MainWindow(QMainWindow):
 
         return True
 
-    def _get_active_recipe_model(self) -> Recipe | None:
+    def _update_draft_controls(self) -> None:
+        is_persisted_draft = bool(self._current_recipe_id and self.table_model.is_draft)
+        if is_persisted_draft:
+            self.btn_save_draft.setText("Save Draft")
+            self.btn_save.setText(f"Finalize v{self.table_model.recipe_version}")
+            has_prior_rev = bool(self.repo.get_recipe_revisions(self._current_recipe_id or ""))
+            if has_prior_rev:
+                self.btn_discard_draft.setText("Discard Draft")
+                self.btn_discard_draft.setToolTip(
+                    "Discard unreleased draft changes and revert to the last finalized revision"
+                )
+                self.btn_discard_draft.setStyleSheet("padding: 6px 12px;")
+            else:
+                self.btn_discard_draft.setText("Delete Draft...")
+                self.btn_discard_draft.setToolTip("Permanently delete this unreleased v1 draft")
+                self.btn_discard_draft.setStyleSheet("color: #dc3545; padding: 6px 12px;")
+            self.btn_discard_draft.setVisible(True)
+            self.btn_discard_draft.setEnabled(True)
+        else:
+            self.btn_save_draft.setText("Save as Draft")
+            self.btn_save.setText("Save Formula")
+            self.btn_discard_draft.setVisible(False)
+
+    def _get_active_recipe_model(self, is_draft: bool | None = None) -> Recipe | None:
         if self.table_model.rowCount() == 0:
             return None
 
         name = self.name_input.text().strip() or "Untitled Recipe"
         desc = self.desc_input.text().strip()
+        resolved_draft = self.table_model.is_draft if is_draft is None else is_draft
 
         ingredients = tuple(
             Ingredient(
@@ -745,17 +791,29 @@ class MainWindow(QMainWindow):
             description=desc,
             version=self.table_model.recipe_version,
             updated_at=self.table_model.recipe_updated_at,
+            is_draft=resolved_draft,
             ingredients=ingredients,
         )
 
-    def _save_current_recipe(self, target_select_id: str | None = None) -> bool:
+    def _save_current_recipe(self, target_select_id: str | None = None, as_draft: bool | None = None) -> bool:
         if not isinstance(target_select_id, str):
             target_select_id = None
 
-        if not self._validate_formulation_before_action(action_name="save"):
+        target_is_draft = self.table_model.is_draft if as_draft is None else as_draft
+        if target_is_draft:
+            action = "save_draft"
+        elif self.table_model.is_draft:
+            action = "finalize"
+        else:
+            action = "save"
+
+        if not self._validate_formulation_before_action(action_name=action):
             return False
 
-        active_recipe = self._get_active_recipe_model()
+        active_recipe = self._get_active_recipe_model(is_draft=target_is_draft)
+        if active_recipe is None:
+            return False
+
         existing = self.repo.get_recipe(active_recipe.id, include_archived=True)
         is_archived = existing is not None and self.repo.get_recipe(active_recipe.id, include_archived=False) is None
         if is_archived:
@@ -772,7 +830,13 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 return False
 
-        if not self._is_dirty and existing is not None and target_select_id is None and not is_archived:
+        if (
+            not self._is_dirty
+            and existing is not None
+            and existing.is_draft == target_is_draft
+            and target_select_id is None
+            and not is_archived
+        ):
             self.statusBar().showMessage("No changes detected; formula is up to date.", 2500)
             return True
 
@@ -787,10 +851,71 @@ class MainWindow(QMainWindow):
         self._load_recipe_archive(select_id=select_id)
         self._trigger_auto_backup(silent=True)
 
+        state_label = "draft saved" if saved_recipe.is_draft else "finalized" if action == "finalize" else "saved"
         self.statusBar().showMessage(
-            f"Formula '{saved_recipe.name}' (v{saved_recipe.version}) saved successfully.", 3500
+            f"Formula '{saved_recipe.name}' (v{saved_recipe.version}) {state_label} successfully.", 3500
         )
         return True
+
+    def _delete_draft_by_id(self, recipe_id: str, recipe_name: str) -> None:
+        reply = QMessageBox.question(
+            self,
+            "Delete Draft Permanently",
+            (
+                f"Permanently delete unreleased draft '{recipe_name}'?\n\n"
+                "This draft has no finalized revisions or production batches and cannot be recovered."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            deleted = self.repo.delete_draft_recipe(recipe_id)
+        except Exception as err:
+            QMessageBox.critical(self, "Delete Draft Error", f"Failed to delete draft:\n{err}")
+            return
+
+        if deleted:
+            self._set_dirty(False)
+            if self._current_recipe_id == recipe_id:
+                self._current_recipe_id = None
+            self._load_recipe_archive()
+            self._trigger_auto_backup(silent=True)
+            self.statusBar().showMessage(f"Deleted draft '{recipe_name}'.", 3500)
+
+    def _discard_current_draft(self) -> None:
+        if not self._current_recipe_id or not self.table_model.is_draft:
+            return
+
+        revs = self.repo.get_recipe_revisions(self._current_recipe_id)
+        if not revs:
+            self._delete_draft_by_id(self._current_recipe_id, self.name_input.text().strip() or "Draft")
+            return
+
+        prev_ver = revs[0]["version"]
+        reply = QMessageBox.question(
+            self,
+            "Discard Draft Changes",
+            (
+                f"Discard unreleased v{self.table_model.recipe_version} draft and revert "
+                f"'{self.name_input.text().strip()}' back to finalized v{prev_ver}?"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        reverted = self.service.discard_draft(self._current_recipe_id)
+        if reverted is not None:
+            self._set_dirty(False)
+            self._load_recipe_archive(select_id=reverted.id)
+            self._trigger_auto_backup(silent=True)
+            self.statusBar().showMessage(
+                f"Discarded draft; reverted '{reverted.name}' to finalized v{reverted.version}.", 3500
+            )
 
     def _delete_current_recipe(self) -> None:
         if self._current_recipe_id is None or self.repo.get_recipe(self._current_recipe_id) is None:
@@ -1102,7 +1227,12 @@ class MainWindow(QMainWindow):
         dialog = ArchivedFormulasDialog(self.repo, self)
         dialog.recipe_restored.connect(self._on_archived_recipe_restored)
         dialog.formula_duplicated.connect(self._on_formula_duplicated_from_history)
+        dialog.draft_deleted.connect(self._on_archived_draft_deleted)
         dialog.exec()
+
+    def _on_archived_draft_deleted(self, recipe_id: str) -> None:
+        self._trigger_auto_backup(silent=True)
+        self.statusBar().showMessage("Deleted archived draft permanently.", 3500)
 
     def _refresh_sidebar_list_preserving_editor(self, select_id: str | None = None) -> None:
         prev_switching = self._is_switching_recipe
@@ -1112,7 +1242,8 @@ class MainWindow(QMainWindow):
             recipes = self.repo.list_recipes()
             selected_row = -1
             for idx, r in enumerate(recipes):
-                item = QListWidgetItem(f"{r.name} (v{r.version})")
+                draft_suffix = " Draft" if r.is_draft else ""
+                item = QListWidgetItem(f"{r.name} (v{r.version}{draft_suffix})")
                 item.setData(Qt.ItemDataRole.UserRole, r.id)
                 self.recipe_list.addItem(item)
                 if select_id is not None and r.id == select_id:
@@ -1171,6 +1302,7 @@ class MainWindow(QMainWindow):
 
         existing = self.repo.get_recipe(rev_recipe.id, include_archived=True)
         current_ver = existing.version if existing is not None else self.table_model.recipe_version
+        current_is_draft = existing.is_draft if existing is not None else False
 
         staged_recipe = Recipe(
             id=rev_recipe.id,
@@ -1178,6 +1310,7 @@ class MainWindow(QMainWindow):
             description=rev_recipe.description,
             version=current_ver,
             updated_at=self.table_model.recipe_updated_at,
+            is_draft=current_is_draft,
             ingredients=rev_recipe.ingredients,
         )
 
@@ -1204,7 +1337,30 @@ class MainWindow(QMainWindow):
         active_id = self.table_model.recipe_id
         is_persisted = bool(active_id and self.repo.get_recipe(active_id) is not None)
 
-        if self._is_dirty or not is_persisted:
+        if self.table_model.is_draft:
+            if self.table_model.current_batch is None:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Batch",
+                    "Formula must sum to 100.00% before finalizing and generating a batch sheet.",
+                )
+                return
+            reply = QMessageBox.question(
+                self,
+                "Finalize Draft Before Printing",
+                (
+                    f"This formula is currently in Draft state (v{self.table_model.recipe_version} Draft).\n"
+                    "Production batch sheets require a finalized immutable revision.\n\n"
+                    f"Finalize as Revision v{self.table_model.recipe_version} and continue to print?"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            if not self._save_current_recipe(as_draft=False):
+                return
+        elif self._is_dirty or not is_persisted:
             prompt = (
                 "The active formula contains unsaved modifications.\n"
                 "Save changes before generating a production batch sheet?"
@@ -1399,21 +1555,46 @@ class MainWindow(QMainWindow):
             return
 
         recipe_id = item.data(Qt.ItemDataRole.UserRole)
+        if recipe_id != self._current_recipe_id:
+            self.recipe_list.setCurrentItem(item)
+            if self._current_recipe_id != recipe_id:
+                return
+
         recipe = self.repo.get_recipe(recipe_id)
         if not recipe:
             return
 
+        revs = self.repo.get_recipe_revisions(recipe.id)
+        batches = self.repo.list_batches(recipe.id)
+        has_history = bool(revs or batches)
+        is_v1_draft = recipe.is_draft and not has_history
+        is_branched_draft = recipe.is_draft and bool(revs)
+
         menu = QMenu(self)
+        menu.setToolTipsVisible(True)
         act_export = menu.addAction(f"Export '{recipe.name}' to JSON...")
-        act_duplicate = menu.addAction("Duplicate Formula")
-        act_history = menu.addAction("View Batch History...")
+        act_duplicate = menu.addAction("Duplicate Draft" if recipe.is_draft else "Duplicate Formula")
+        act_history = menu.addAction("View History...")
+        if not has_history:
+            act_history.setEnabled(False)
+            act_history.setToolTip("No saved revisions or production batches yet.")
+        else:
+            act_history.triggered.connect(self._open_batch_history_dialog)
+
         menu.addSeparator()
-        act_archive = menu.addAction("Archive Formula")
+        if is_branched_draft:
+            act_discard = menu.addAction(f"Discard Draft (Revert to v{revs[0]['version']})...")
+            act_discard.triggered.connect(self._discard_current_draft)
+
+        act_archive = menu.addAction("Archive Draft" if recipe.is_draft else "Archive Formula")
+        act_archive.triggered.connect(self._delete_current_recipe)
+
+        if is_v1_draft:
+            act_delete_draft = menu.addAction("Delete Draft...")
+            act_delete_draft.triggered.connect(lambda: self._delete_draft_by_id(recipe.id, recipe.name))
 
         act_export.triggered.connect(self._export_recipe)
         act_duplicate.triggered.connect(lambda: self._duplicate_selected_recipe(recipe))
-        act_history.triggered.connect(self._open_batch_history_dialog)
-        act_archive.triggered.connect(self._delete_current_recipe)
 
         menu.exec(self.recipe_list.viewport().mapToGlobal(pos))
 
@@ -1423,6 +1604,7 @@ class MainWindow(QMainWindow):
             name=f"{recipe.name} (Copy)",
             description=recipe.description,
             version=1,
+            is_draft=recipe.is_draft,
             ingredients=recipe.ingredients,
         )
         saved = self.service.save_recipe(dupe)

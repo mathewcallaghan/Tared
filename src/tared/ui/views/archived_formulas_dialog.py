@@ -1,4 +1,4 @@
-"""Dialog for viewing, inspecting history, and restoring archived formulas."""
+"""Dialog for viewing, inspecting history, restoring, and cleaning up archived formulas."""
 
 from __future__ import annotations
 
@@ -19,15 +19,16 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
-from tared.storage.base import RecipeRepository
+from tared.storage.base import RecipeRepository, StorageError
 from tared.ui.views.batch_history_dialog import BatchHistoryDialog
 
 
 class ArchivedFormulasDialog(QDialog):
-    """Modal dialog displaying archived formulas with restore and historical inspection actions."""
+    """Modal dialog displaying archived formulas with restore, history, and draft cleanup actions."""
 
     recipe_restored = pyqtSignal(str)
     formula_duplicated = pyqtSignal(str)
+    draft_deleted = pyqtSignal(str)
 
     def __init__(self, repository: RecipeRepository, parent: Any = None) -> None:
         super().__init__(parent)
@@ -81,18 +82,25 @@ class ArchivedFormulasDialog(QDialog):
         layout.addWidget(self.table)
 
         btn_layout = QHBoxLayout()
-        self.btn_restore = QPushButton("Restore to Active Library")
-        self.btn_restore.setStyleSheet("font-weight: bold; padding: 6px 14px;")
-        self.btn_restore.setEnabled(False)
-
         self.btn_history = QPushButton("View History...")
         self.btn_history.setStyleSheet("padding: 6px 14px;")
         self.btn_history.setEnabled(False)
+
+        self.btn_delete_draft = QPushButton("Delete Draft...")
+        self.btn_delete_draft.setStyleSheet("color: #dc3545; padding: 6px 14px;")
+        self.btn_delete_draft.setToolTip("Permanently delete an unreleased v1 draft with no revisions or batches")
+        self.btn_delete_draft.setVisible(False)
+        self.btn_delete_draft.setEnabled(False)
+
+        self.btn_restore = QPushButton("Restore to Active Library")
+        self.btn_restore.setStyleSheet("font-weight: bold; padding: 6px 14px;")
+        self.btn_restore.setEnabled(False)
 
         self.btn_close = QPushButton("Close")
         self.btn_close.setStyleSheet("padding: 6px 14px;")
 
         btn_layout.addWidget(self.btn_history)
+        btn_layout.addWidget(self.btn_delete_draft)
         btn_layout.addStretch()
         btn_layout.addWidget(self.btn_restore)
         btn_layout.addWidget(self.btn_close)
@@ -100,8 +108,9 @@ class ArchivedFormulasDialog(QDialog):
 
         self.search_input.textChanged.connect(self._filter_rows)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
-        self.table.itemDoubleClicked.connect(lambda: self._open_selected_history())
+        self.table.itemDoubleClicked.connect(self._on_row_double_clicked)
         self.btn_history.clicked.connect(self._open_selected_history)
+        self.btn_delete_draft.clicked.connect(self._delete_selected_draft)
         self.btn_restore.clicked.connect(self._restore_selected)
         self.btn_close.clicked.connect(self.accept)
 
@@ -113,7 +122,8 @@ class ArchivedFormulasDialog(QDialog):
             item_name = QTableWidgetItem(str(rec.get("name", "")))
             item_name.setData(Qt.ItemDataRole.UserRole, rec.get("id", ""))
 
-            item_ver = QTableWidgetItem(f"v{rec.get('version', 1)}")
+            ver_suffix = " (Draft)" if rec.get("is_draft") else ""
+            item_ver = QTableWidgetItem(f"v{rec.get('version', 1)}{ver_suffix}")
             item_ver.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
             item_updated = QTableWidgetItem(str(rec.get("updated_at", "") or "—"))
@@ -158,9 +168,30 @@ class ArchivedFormulasDialog(QDialog):
         return None
 
     def _on_selection_changed(self) -> None:
-        has_sel = self._get_selected_record() is not None
+        rec = self._get_selected_record()
+        has_sel = rec is not None
         self.btn_restore.setEnabled(has_sel)
-        self.btn_history.setEnabled(has_sel)
+
+        if rec is None:
+            self.btn_history.setEnabled(False)
+            self.btn_history.setToolTip("")
+            self.btn_delete_draft.setVisible(False)
+            self.btn_delete_draft.setEnabled(False)
+            return
+
+        rev_count = int(rec.get("revision_count", 0))
+        batch_count = int(rec.get("batch_count", 0))
+        has_history = rev_count > 0 or batch_count > 0
+        self.btn_history.setEnabled(has_history)
+        self.btn_history.setToolTip("" if has_history else "No saved revisions or production batches yet.")
+
+        is_deletable_draft = bool(rec.get("is_draft")) and not has_history
+        self.btn_delete_draft.setVisible(is_deletable_draft)
+        self.btn_delete_draft.setEnabled(is_deletable_draft)
+
+    def _on_row_double_clicked(self) -> None:
+        if self.btn_history.isEnabled():
+            self._open_selected_history()
 
     def _open_selected_history(self) -> None:
         rec = self._get_selected_record()
@@ -175,6 +206,33 @@ class ArchivedFormulasDialog(QDialog):
         )
         dialog.formula_duplicated.connect(self.formula_duplicated.emit)
         dialog.exec()
+
+    def _delete_selected_draft(self) -> None:
+        rec = self._get_selected_record()
+        if rec is None:
+            return
+
+        recipe_id = str(rec["id"])
+        recipe_name = str(rec.get("name", ""))
+        reply = QMessageBox.question(
+            self,
+            "Delete Draft Permanently",
+            (
+                f"Permanently delete unreleased draft '{recipe_name}'?\n\n"
+                "This draft has no finalized revisions or production batches and cannot be recovered."
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            if self.repo.delete_draft_recipe(recipe_id):
+                self._load_archived()
+                self.draft_deleted.emit(recipe_id)
+        except StorageError as err:
+            QMessageBox.critical(self, "Delete Draft Error", f"Failed to delete draft:\n{err}")
 
     def _restore_selected(self) -> None:
         rec = self._get_selected_record()

@@ -48,6 +48,10 @@ class RecipeRepository(ABC):
         """Restore an archived recipe back to the active formula library."""
 
     @abstractmethod
+    def delete_draft_recipe(self, recipe_id: str) -> bool:
+        """Permanently delete an unreleased draft recipe that has zero revisions and zero batches."""
+
+    @abstractmethod
     def get_recipe_revisions(self, recipe_id: str) -> list[dict[str, Any]]:
         """Retrieve historical immutable revision snapshots for a recipe."""
 

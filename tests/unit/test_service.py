@@ -328,6 +328,71 @@ class TestRecipeService(unittest.TestCase):
         self.assertEqual(summarize_revision_diff(revs_v4[1], revs_v4[0]), "Reordered ingredients")
         self.assertIn("Added Vanilla (5.00%)", summarize_revision_diff(revs_v4[0], revs_v4[2]))
 
+    def test_draft_lifecycle_saves_without_bumping_and_finalizes(self) -> None:
+        draft_v1 = Recipe(
+            id="rec-draft-01",
+            name="R&D Formula",
+            is_draft=True,
+            ingredients=(
+                Ingredient("Water", Decimal("50.00"), Decimal("0.10")),
+                Ingredient("Sugar", Decimal("30.00"), Decimal("1.00")),
+            ),
+        )
+        saved1 = self.service.save_recipe(draft_v1)
+        self.assertEqual(saved1.version, 1)
+        self.assertTrue(saved1.is_draft)
+        self.assertEqual(len(self.repo.get_recipe_revisions("rec-draft-01")), 0)
+
+        # Repeated edits in draft mode stay at v1 with zero revisions
+        draft_edit2 = Recipe(
+            id="rec-draft-01",
+            name="R&D Formula vNext",
+            description="Updated mixing",
+            is_draft=True,
+            ingredients=(
+                Ingredient("Water", Decimal("70.00"), Decimal("0.10")),
+                Ingredient("Sugar", Decimal("30.00"), Decimal("1.20")),
+            ),
+        )
+        saved2 = self.service.save_recipe(draft_edit2)
+        self.assertEqual(saved2.version, 1)
+        self.assertTrue(saved2.is_draft)
+        self.assertEqual(len(self.repo.get_recipe_revisions("rec-draft-01")), 0)
+
+        # Finalize v1 draft -> locks v1 into recipe_revisions
+        finalize_v1 = Recipe(
+            id=saved2.id,
+            name=saved2.name,
+            description=saved2.description,
+            is_draft=False,
+            ingredients=saved2.ingredients,
+        )
+        finalized = self.service.save_recipe(finalize_v1)
+        self.assertEqual(finalized.version, 1)
+        self.assertFalse(finalized.is_draft)
+        self.assertEqual(len(self.repo.get_recipe_revisions("rec-draft-01")), 1)
+
+        # Branch v2 draft from released v1 -> reserves v2 while preserving v1 revision
+        branch_v2 = Recipe(
+            id="rec-draft-01",
+            name=finalized.name,
+            description="Testing v2 changes",
+            is_draft=True,
+            ingredients=finalized.ingredients,
+        )
+        saved_v2_draft = self.service.save_recipe(branch_v2)
+        self.assertEqual(saved_v2_draft.version, 2)
+        self.assertTrue(saved_v2_draft.is_draft)
+        self.assertEqual(len(self.repo.get_recipe_revisions("rec-draft-01")), 1)
+
+        # Discard v2 draft -> reverts cleanly back to released v1
+        reverted = self.service.discard_draft("rec-draft-01")
+        self.assertIsNotNone(reverted)
+        assert reverted is not None
+        self.assertEqual(reverted.version, 1)
+        self.assertFalse(reverted.is_draft)
+        self.assertEqual(reverted.description, "Updated mixing")
+
 
 if __name__ == "__main__":
     unittest.main()

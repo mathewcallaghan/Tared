@@ -198,6 +198,7 @@ class RecipeTableModel(QAbstractTableModel):
         self._recipe_description: str = ""
         self._recipe_version: int = 1
         self._recipe_updated_at: str = ""
+        self._is_draft: bool = False
         self._ingredients: list[dict[str, Any]] = []
         self._next_original_order: int = 0
         self._target_weight: Decimal = Decimal("1000.00")
@@ -225,6 +226,10 @@ class RecipeTableModel(QAbstractTableModel):
     @property
     def recipe_updated_at(self) -> str:
         return self._recipe_updated_at
+
+    @property
+    def is_draft(self) -> bool:
+        return self._is_draft
 
     @property
     def precision(self) -> Decimal:
@@ -432,6 +437,7 @@ class RecipeTableModel(QAbstractTableModel):
         self._recipe_description = description
         self._recipe_version = 1
         self._recipe_updated_at = ""
+        self._is_draft = False
         self._ingredients = []
         self._next_original_order = 0
         self.endResetModel()
@@ -444,6 +450,7 @@ class RecipeTableModel(QAbstractTableModel):
         self._recipe_description = recipe.description
         self._recipe_version = recipe.version
         self._recipe_updated_at = recipe.updated_at
+        self._is_draft = recipe.is_draft
         self._ingredients = [
             {
                 "name": ing.name,
@@ -564,6 +571,7 @@ class RecipeTableModel(QAbstractTableModel):
             description=self._recipe_description,
             version=self._recipe_version,
             updated_at=self._recipe_updated_at,
+            is_draft=self._is_draft,
             ingredients=ingredients,
         )
 

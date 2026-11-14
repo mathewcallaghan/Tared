@@ -1176,6 +1176,135 @@ class TestRecipeTableModelIntegration(unittest.TestCase):
         self.assertEqual(window.name_input.text(), "Unsaved Active Edit")
         self.assertTrue(window._is_dirty)
 
+    def test_main_window_draft_mode_edit_finalize_and_discard_workflow(self) -> None:
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        window = MainWindow(repo)
+        self.addCleanup(window.close)
+
+        # 1. Create new formula and Save as Draft (< 100%, no nagging prompt)
+        window.name_input.setText("Experimental Sauce")
+        window.table_model.add_ingredient("Tomato", Decimal("40.00"), Decimal("2.00"))
+        self.assertTrue(window._save_current_recipe(as_draft=True))
+
+        draft_id = window._current_recipe_id
+        assert draft_id is not None
+        self.assertTrue(window.table_model.is_draft)
+        self.assertIn("Draft", window.recipe_list.item(0).text())
+        self.assertTrue(window.btn_discard_draft.isVisibleTo(window))
+        self.assertEqual(window.btn_discard_draft.text(), "Delete Draft...")
+        self.assertEqual(len(repo.get_recipe_revisions(draft_id)), 0)
+
+        # 2. Edit draft multiple times -> stays at v1 Draft
+        window.table_model.add_ingredient("Water", Decimal("60.00"), Decimal("0.10"))
+        self.assertTrue(window._save_current_recipe())
+        saved = repo.get_recipe(draft_id)
+        assert saved is not None
+        self.assertEqual(saved.version, 1)
+        self.assertTrue(saved.is_draft)
+        self.assertEqual(len(repo.get_recipe_revisions(draft_id)), 0)
+
+        # 3. Finalize v1 -> locks v1 snapshot
+        self.assertTrue(window._save_current_recipe(as_draft=False))
+        finalized = repo.get_recipe(draft_id)
+        assert finalized is not None
+        self.assertEqual(finalized.version, 1)
+        self.assertFalse(finalized.is_draft)
+        self.assertEqual(len(repo.get_recipe_revisions(draft_id)), 1)
+
+        # 4. Branch v2 Draft from v1, then discard back to v1
+        self.assertTrue(window._save_current_recipe(as_draft=True))
+        self.assertEqual(window.table_model.recipe_version, 2)
+        self.assertTrue(window.table_model.is_draft)
+        self.assertTrue(window.btn_discard_draft.isVisibleTo(window))
+        self.assertEqual(window.btn_discard_draft.text(), "Discard Draft")
+
+        window.name_input.setText("Abandoned v2 Experiment")
+        self.mock_question.return_value = QMessageBox.StandardButton.Yes
+        window._discard_current_draft()
+
+        reverted = repo.get_recipe(draft_id)
+        assert reverted is not None
+        self.assertEqual(reverted.version, 1)
+        self.assertFalse(reverted.is_draft)
+        self.assertEqual(window.name_input.text(), "Experimental Sauce")
+
+    def test_print_dialog_prompts_to_finalize_draft_before_printing(self) -> None:
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        draft_rec = Recipe(
+            id="rec-print-draft",
+            name="Printable Draft",
+            version=1,
+            is_draft=True,
+            ingredients=(Ingredient("Base", Decimal("100.00"), Decimal("2.00")),),
+        )
+        repo.save_recipe(draft_rec)
+
+        window = MainWindow(repo)
+        self.addCleanup(window.close)
+        self.assertTrue(window.table_model.is_draft)
+
+        self.mock_question.return_value = QMessageBox.StandardButton.Cancel
+        with patch("tared.ui.views.main_window.PrintBatchSheetDialog") as mock_dlg:
+            window._open_print_dialog()
+            mock_dlg.assert_not_called()
+        self.assertTrue(repo.get_recipe("rec-print-draft").is_draft)
+
+        self.mock_question.return_value = QMessageBox.StandardButton.Yes
+        with patch("tared.ui.views.main_window.PrintBatchSheetDialog") as mock_dlg:
+            window._open_print_dialog()
+            mock_dlg.assert_called_once()
+        finalized = repo.get_recipe("rec-print-draft")
+        assert finalized is not None
+        self.assertFalse(finalized.is_draft)
+        self.assertEqual(len(repo.get_recipe_revisions("rec-print-draft")), 1)
+
+    def test_delete_v1_draft_from_main_window_and_archive_dialog(self) -> None:
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        active_draft = Recipe(
+            id="rec-active-draft-del",
+            name="Active Test Draft",
+            version=1,
+            is_draft=True,
+            ingredients=(Ingredient("Water", Decimal("30.00")),),
+        )
+        archived_draft = Recipe(
+            id="rec-arch-draft-del",
+            name="Archived Test Draft",
+            version=1,
+            is_draft=True,
+            ingredients=(Ingredient("Sugar", Decimal("25.00")),),
+        )
+        repo.save_recipe(active_draft)
+        repo.save_recipe(archived_draft)
+        repo.delete_recipe("rec-arch-draft-del")
+
+        window = MainWindow(repo)
+        self.addCleanup(window.close)
+
+        # Duplicate preserves is_draft=True
+        window._duplicate_selected_recipe(active_draft)
+        dupes = [r for r in repo.list_recipes() if "(Copy)" in r.name]
+        self.assertEqual(len(dupes), 1)
+        self.assertTrue(dupes[0].is_draft)
+
+        # Delete active v1 draft via Delete Draft action
+        self.mock_question.return_value = QMessageBox.StandardButton.Yes
+        window._delete_draft_by_id("rec-active-draft-del", "Active Test Draft")
+        self.assertIsNone(repo.get_recipe("rec-active-draft-del", include_archived=True))
+
+        # Delete archived v1 draft from ArchivedFormulasDialog
+        arch_dialog = ArchivedFormulasDialog(repo, parent=window)
+        self.assertEqual(arch_dialog.table.rowCount(), 1)
+        self.assertTrue(arch_dialog.btn_delete_draft.isVisibleTo(arch_dialog))
+        self.assertFalse(arch_dialog.btn_history.isEnabled())
+        arch_dialog._delete_selected_draft()
+        self.assertEqual(arch_dialog.table.rowCount(), 0)
+        self.assertIsNone(repo.get_recipe("rec-arch-draft-del", include_archived=True))
+        arch_dialog.close()
+
 
 if __name__ == "__main__":
     unittest.main()

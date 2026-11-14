@@ -55,7 +55,8 @@ class SQLiteRecipeRepository(RecipeRepository):
                     description TEXT NOT NULL DEFAULT '',
                     version INTEGER NOT NULL DEFAULT 1,
                     updated_at TEXT NOT NULL DEFAULT '',
-                    is_archived INTEGER NOT NULL DEFAULT 0
+                    is_archived INTEGER NOT NULL DEFAULT 0,
+                    is_draft INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS ingredients (
@@ -202,6 +203,13 @@ class SQLiteRecipeRepository(RecipeRepository):
 
                 conn.execute("PRAGMA user_version = 1;")
 
+            if user_version < 2:
+                cursor = conn.execute("PRAGMA table_info(recipes);")
+                recipe_cols = [row["name"] for row in cursor.fetchall()]
+                if "is_draft" not in recipe_cols:
+                    conn.execute("ALTER TABLE recipes ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0;")
+                conn.execute("PRAGMA user_version = 2;")
+
         if not self._is_memory:
             conn.close()
 
@@ -244,20 +252,22 @@ class SQLiteRecipeRepository(RecipeRepository):
         snapshot_id = str(uuid.uuid4())
         created_at = recipe.updated_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+        is_draft_int = 1 if recipe.is_draft else 0
         try:
             with conn:
                 conn.execute(
                     """
-                    INSERT INTO recipes (id, name, description, version, updated_at, is_archived)
-                    VALUES (?, ?, ?, ?, ?, 0)
+                    INSERT INTO recipes (id, name, description, version, updated_at, is_archived, is_draft)
+                    VALUES (?, ?, ?, ?, ?, 0, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         name = excluded.name,
                         description = excluded.description,
                         version = excluded.version,
                         updated_at = excluded.updated_at,
-                        is_archived = 0;
+                        is_archived = 0,
+                        is_draft = excluded.is_draft;
                     """,
-                    (recipe.id, recipe.name, recipe.description, recipe.version, recipe.updated_at),
+                    (recipe.id, recipe.name, recipe.description, recipe.version, recipe.updated_at, is_draft_int),
                 )
                 conn.execute("DELETE FROM ingredients WHERE recipe_id = ?;", (recipe.id,))
                 conn.executemany(
@@ -281,7 +291,13 @@ class SQLiteRecipeRepository(RecipeRepository):
                     "WHERE recipe_id = ? AND version = ?;",
                     (recipe.id, recipe.version),
                 ).fetchone()
-                if existing_rev is None:
+                if recipe.is_draft:
+                    if existing_rev is not None:
+                        raise StorageError(
+                            f"Draft version conflict: Recipe '{recipe.name}' (id='{recipe.id}') "
+                            f"already has an immutable revision at v{recipe.version}."
+                        )
+                elif existing_rev is None:
                     conn.execute(
                         """
                         INSERT INTO recipe_revisions (
@@ -313,7 +329,7 @@ class SQLiteRecipeRepository(RecipeRepository):
     def get_recipe(self, recipe_id: str, include_archived: bool = False) -> Recipe | None:
         conn = self._get_connection()
         try:
-            query = "SELECT id, name, description, version, updated_at FROM recipes WHERE id = ?"
+            query = "SELECT id, name, description, version, updated_at, is_draft FROM recipes WHERE id = ?"
             if not include_archived:
                 query += " AND is_archived = 0;"
             else:
@@ -349,6 +365,7 @@ class SQLiteRecipeRepository(RecipeRepository):
                 description=recipe_row["description"],
                 version=int(recipe_row["version"]),
                 updated_at=recipe_row["updated_at"],
+                is_draft=bool(recipe_row["is_draft"]),
                 ingredients=ingredients,
             )
         finally:
@@ -579,7 +596,7 @@ class SQLiteRecipeRepository(RecipeRepository):
         conn = self._get_connection()
         try:
             recipe_rows = conn.execute(
-                "SELECT id, name, description, version, updated_at FROM recipes "
+                "SELECT id, name, description, version, updated_at, is_draft FROM recipes "
                 "WHERE is_archived = 0 ORDER BY name ASC;"
             ).fetchall()
 
@@ -624,6 +641,7 @@ class SQLiteRecipeRepository(RecipeRepository):
                             description=r_row["description"],
                             version=int(r_row["version"]),
                             updated_at=r_row["updated_at"],
+                            is_draft=bool(r_row["is_draft"]),
                             ingredients=ings,
                         )
                     )
@@ -661,6 +679,7 @@ class SQLiteRecipeRepository(RecipeRepository):
                     r.description,
                     r.version,
                     r.updated_at,
+                    r.is_draft,
                     (SELECT COUNT(*) FROM ingredients i WHERE i.recipe_id = r.id) AS ingredient_count,
                     (SELECT COUNT(*) FROM batches b WHERE b.recipe_id = r.id) AS batch_count,
                     (SELECT COUNT(*) FROM recipe_revisions rv WHERE rv.recipe_id = r.id) AS revision_count
@@ -681,6 +700,46 @@ class SQLiteRecipeRepository(RecipeRepository):
             with conn:
                 cursor = conn.execute(
                     "UPDATE recipes SET is_archived = 0 WHERE id = ? AND is_archived = 1;",
+                    (recipe_id,),
+                )
+                return cursor.rowcount > 0
+        finally:
+            if not self._is_memory:
+                conn.close()
+
+    def delete_draft_recipe(self, recipe_id: str) -> bool:
+        """Permanently delete an unreleased draft recipe with zero revisions and zero batches."""
+        conn = self._get_connection()
+        try:
+            with conn:
+                row = conn.execute(
+                    "SELECT is_draft FROM recipes WHERE id = ?;",
+                    (recipe_id,),
+                ).fetchone()
+                if row is None:
+                    return False
+                if not bool(row["is_draft"]):
+                    raise StorageError("Only draft formulas can be permanently deleted.")
+
+                rev_count = conn.execute(
+                    "SELECT COUNT(*) FROM recipe_revisions WHERE recipe_id = ?;",
+                    (recipe_id,),
+                ).fetchone()[0]
+                if rev_count > 0:
+                    raise StorageError(
+                        "Cannot permanently delete a draft that has prior committed revisions. "
+                        "Use Discard Draft to revert instead."
+                    )
+
+                batch_count = conn.execute(
+                    "SELECT COUNT(*) FROM batches WHERE recipe_id = ?;",
+                    (recipe_id,),
+                ).fetchone()[0]
+                if batch_count > 0:
+                    raise StorageError("Cannot permanently delete a draft referenced by production batches.")
+
+                cursor = conn.execute(
+                    "DELETE FROM recipes WHERE id = ? AND is_draft = 1;",
                     (recipe_id,),
                 )
                 return cursor.rowcount > 0
@@ -909,7 +968,8 @@ class SQLiteRecipeRepository(RecipeRepository):
         conn = self._get_connection()
         try:
             recipe_rows = conn.execute(
-                "SELECT id, name, description, version, updated_at, is_archived FROM recipes ORDER BY name ASC;"
+                "SELECT id, name, description, version, updated_at, is_archived, is_draft "
+                "FROM recipes ORDER BY name ASC;"
             ).fetchall()
             if not recipe_rows:
                 return []
@@ -943,6 +1003,7 @@ class SQLiteRecipeRepository(RecipeRepository):
                         "version": int(r_row["version"]),
                         "updated_at": r_row["updated_at"],
                         "is_archived": int(r_row["is_archived"]),
+                        "is_draft": int(r_row["is_draft"]),
                         "ingredients": ingredients_by_recipe.get(r_id, []),
                     }
                 )
@@ -974,7 +1035,7 @@ class SQLiteRecipeRepository(RecipeRepository):
                 ]
 
                 recipe_rows = conn.execute(
-                    "SELECT id, name, description, version, updated_at, is_archived "
+                    "SELECT id, name, description, version, updated_at, is_archived, is_draft "
                     "FROM recipes ORDER BY name ASC;"
                 ).fetchall()
 
@@ -1007,6 +1068,7 @@ class SQLiteRecipeRepository(RecipeRepository):
                             "version": int(r_row["version"]),
                             "updated_at": r_row["updated_at"],
                             "is_archived": int(r_row["is_archived"]),
+                            "is_draft": int(r_row["is_draft"]),
                             "ingredients": ingredients_by_recipe.get(r_id, []),
                         }
                     )
@@ -1075,6 +1137,7 @@ class SQLiteRecipeRepository(RecipeRepository):
                     "created_at": r.get("updated_at", "") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 }
                 for r in recipes_data
+                if not r.get("is_draft", 0)
             ]
 
         def _populate_connection(target_conn: sqlite3.Connection) -> None:
@@ -1090,8 +1153,8 @@ class SQLiteRecipeRepository(RecipeRepository):
                 # 1. Recipes & Ingredients
                 for r in recipes_data:
                     target_conn.execute(
-                        "INSERT INTO recipes (id, name, description, version, updated_at, is_archived) "
-                        "VALUES (?, ?, ?, ?, ?, ?);",
+                        "INSERT INTO recipes (id, name, description, version, updated_at, is_archived, is_draft) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?);",
                         (
                             r["id"],
                             r["name"],
@@ -1099,6 +1162,7 @@ class SQLiteRecipeRepository(RecipeRepository):
                             r.get("version", 1),
                             r.get("updated_at", ""),
                             r.get("is_archived", 0),
+                            1 if r.get("is_draft", 0) else 0,
                         ),
                     )
                     ings = r.get("ingredients", [])

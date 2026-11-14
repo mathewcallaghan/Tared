@@ -459,6 +459,74 @@ class TestSQLiteRecipeRepository(unittest.TestCase):
         self.assertTrue(self.repo.batch_exists("BAT-PADDED-01"))
         self.assertTrue(self.repo.batch_exists("  BAT-PADDED-01  "))
 
+    def test_draft_recipe_blocks_revision_overwrite_and_batch_logging(self) -> None:
+        self.repo.save_recipe(self.recipe)
+        conflicting_draft = Recipe(
+            id=self.recipe.id,
+            name="Conflicting Draft",
+            version=1,
+            is_draft=True,
+            ingredients=self.recipe.ingredients,
+        )
+        with self.assertRaises(StorageError):
+            self.repo.save_recipe(conflicting_draft)
+
+        v2_draft = Recipe(
+            id=self.recipe.id,
+            name="Valid v2 Draft",
+            version=2,
+            is_draft=True,
+            ingredients=self.recipe.ingredients,
+        )
+        self.repo.save_recipe(v2_draft)
+        loaded = self.repo.get_recipe(self.recipe.id)
+        self.assertIsNotNone(loaded)
+        assert loaded is not None
+        self.assertTrue(loaded.is_draft)
+        self.assertEqual(loaded.version, 2)
+
+        with self.assertRaises(RecipeNotFoundError):
+            self.repo.record_batch(
+                recipe_id=self.recipe.id,
+                recipe_version=2,
+                batch_number="BAT-DRAFT-BLOCK",
+                operator="Op",
+                target_weight="100.00",
+                total_weight="100.00",
+                total_cost="1.00",
+            )
+
+    def test_delete_draft_recipe_enforces_safety_guards(self) -> None:
+        # 1. Active v1 Draft with 0 revisions can be permanently deleted
+        v1_draft = Recipe(
+            id="rec-del-draft-1",
+            name="Disposable Draft",
+            version=1,
+            is_draft=True,
+            ingredients=(Ingredient("Base", Decimal("40.00")),),
+        )
+        self.repo.save_recipe(v1_draft)
+        self.assertTrue(self.repo.delete_draft_recipe("rec-del-draft-1"))
+        self.assertIsNone(self.repo.get_recipe("rec-del-draft-1", include_archived=True))
+        self.assertFalse(self.repo.delete_draft_recipe("rec-del-draft-1"))
+
+        # 2. Released recipe cannot be deleted via delete_draft_recipe
+        self.repo.save_recipe(self.recipe)
+        with self.assertRaises(StorageError):
+            self.repo.delete_draft_recipe(self.recipe.id)
+
+        # 3. Branched v2 Draft with prior v1 revision cannot be deleted via delete_draft_recipe
+        v2_draft = Recipe(
+            id=self.recipe.id,
+            name="Branched Draft",
+            version=2,
+            is_draft=True,
+            ingredients=self.recipe.ingredients,
+        )
+        self.repo.save_recipe(v2_draft)
+        with self.assertRaises(StorageError):
+            self.repo.delete_draft_recipe(self.recipe.id)
+
 
 class TestJSONRepository(unittest.TestCase):
     def setUp(self) -> None:
