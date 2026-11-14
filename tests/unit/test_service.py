@@ -4,7 +4,7 @@ import unittest
 from decimal import Decimal
 
 from tared.core.models import CatalogIngredient, Ingredient, Recipe
-from tared.core.service import RecipeService
+from tared.core.service import RecipeService, summarize_revision_diff
 from tared.storage.sqlite_repo import SQLiteRecipeRepository
 
 
@@ -272,6 +272,61 @@ class TestRecipeService(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             self.service.import_recipe(incoming, collision_mode="raise")
+
+    def test_summarize_revision_diff_detects_all_change_types(self) -> None:
+        self.service.save_recipe(self.initial_recipe)
+
+        v2 = Recipe(
+            id=self.initial_recipe.id,
+            name="Vanilla Glaze Pro",
+            description="Updated SOP",
+            ingredients=(
+                Ingredient(name="Sugar", percentage=Decimal("65.00"), cost_per_unit=Decimal("0.85")),
+                Ingredient(name="Water", percentage=Decimal("30.00"), cost_per_unit=Decimal("0.05")),
+                Ingredient(name="Vanilla", percentage=Decimal("5.00"), cost_per_unit=Decimal("12.00")),
+            ),
+        )
+        self.service.save_recipe(v2)
+
+        v3 = Recipe(
+            id=self.initial_recipe.id,
+            name="Vanilla Glaze Pro",
+            description="Updated SOP",
+            ingredients=(
+                Ingredient(name="Water", percentage=Decimal("30.00"), cost_per_unit=Decimal("0.05")),
+                Ingredient(name="Sugar", percentage=Decimal("70.00"), cost_per_unit=Decimal("0.95")),
+            ),
+        )
+        self.service.save_recipe(v3)
+
+        revs = self.repo.get_recipe_revisions(self.initial_recipe.id)
+        self.assertEqual(len(revs), 3)
+        self.assertEqual(summarize_revision_diff(None, revs[2]), "Initial saved formulation")
+
+        diff_v2 = summarize_revision_diff(revs[2], revs[1])
+        self.assertIn("Renamed to 'Vanilla Glaze Pro'", diff_v2)
+        self.assertIn("Updated description/SOP", diff_v2)
+        self.assertIn("Sugar: 70.00% → 65.00%", diff_v2)
+        self.assertIn("+2 more", diff_v2)
+
+        diff_v3 = summarize_revision_diff(revs[1], revs[0])
+        self.assertIn("Removed Vanilla", diff_v3)
+        self.assertIn("Sugar: 65.00% → 70.00%", diff_v3)
+        self.assertIn("Sugar cost: $0.85 → $0.95/kg", diff_v3)
+
+        v4 = Recipe(
+            id=self.initial_recipe.id,
+            name="Vanilla Glaze Pro",
+            description="Updated SOP",
+            ingredients=(
+                Ingredient(name="Sugar", percentage=Decimal("70.00"), cost_per_unit=Decimal("0.95")),
+                Ingredient(name="Water", percentage=Decimal("30.00"), cost_per_unit=Decimal("0.05")),
+            ),
+        )
+        self.service.save_recipe(v4)
+        revs_v4 = self.repo.get_recipe_revisions(self.initial_recipe.id)
+        self.assertEqual(summarize_revision_diff(revs_v4[1], revs_v4[0]), "Reordered ingredients")
+        self.assertIn("Added Vanilla (5.00%)", summarize_revision_diff(revs_v4[0], revs_v4[2]))
 
 
 if __name__ == "__main__":

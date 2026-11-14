@@ -19,6 +19,7 @@ try:
     from PyQt6.QtWidgets import QApplication, QMessageBox
 
     from tared.ui.models.recipe_table_model import RecipeTableModel
+    from tared.ui.views.archived_formulas_dialog import ArchivedFormulasDialog
     from tared.ui.views.batch_history_dialog import BatchHistoryDialog
     from tared.ui.views.catalog_dialog import CatalogManagerDialog
     from tared.ui.views.catalog_picker_dialog import CatalogPickerDialog
@@ -1075,6 +1076,105 @@ class TestRecipeTableModelIntegration(unittest.TestCase):
         selection = QItemSelection(idx_start, idx_end)
         sel_model.select(selection, QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
         self.assertEqual(len(sel_model.selectedRows()), 3)
+
+    def test_batch_history_displays_revisions_and_restores_to_editor(self) -> None:
+        from tared.core.service import RecipeService
+
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        service = RecipeService(repo)
+
+        r_v1 = Recipe(
+            id="rec-rev-ui",
+            name="Emulsion Base",
+            description="Phase 1 SOP",
+            ingredients=(
+                Ingredient("Water", Decimal("80.00"), Decimal("0.10")),
+                Ingredient("Oil", Decimal("20.00"), Decimal("5.00")),
+            ),
+        )
+        service.save_recipe(r_v1)
+
+        r_v2 = Recipe(
+            id="rec-rev-ui",
+            name="Emulsion Base",
+            description="Phase 2 SOP",
+            ingredients=(
+                Ingredient("Water", Decimal("75.00"), Decimal("0.10")),
+                Ingredient("Oil", Decimal("25.00"), Decimal("5.00")),
+            ),
+        )
+        service.save_recipe(r_v2)
+
+        window = MainWindow(repo)
+        self.addCleanup(window.close)
+        self.assertEqual(window.table_model.recipe_version, 2)
+
+        dialog = BatchHistoryDialog("rec-rev-ui", "Emulsion Base", repo, parent=window)
+        self.assertEqual(dialog.tabs.currentIndex(), 1)
+        self.assertEqual(dialog.revisions_table.rowCount(), 2)
+        self.assertEqual(dialog.revisions_table.item(0, 0).text(), "v2")
+        self.assertEqual(dialog.revisions_table.item(1, 0).text(), "v1")
+
+        dialog.revision_restored.connect(window._restore_revision_to_editor)
+        dialog.revisions_table.selectRow(1)
+        dialog._restore_selected_revision()
+
+        self.assertTrue(window._is_dirty)
+        self.assertEqual(window.desc_input.text(), "Phase 1 SOP")
+        self.assertEqual(window.table_model.ingredients_data[0]["percentage"], Decimal("80.00"))
+
+        window._save_current_recipe()
+        saved = repo.get_recipe("rec-rev-ui")
+        assert saved is not None
+        self.assertEqual(saved.version, 3)
+        self.assertEqual(len(repo.get_recipe_revisions("rec-rev-ui")), 3)
+
+    def test_batch_history_duplicate_revision_creates_new_formula(self) -> None:
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        repo.save_recipe(self.recipe)
+
+        window = MainWindow(repo)
+        self.addCleanup(window.close)
+
+        dialog = BatchHistoryDialog(self.recipe.id, self.recipe.name, repo, parent=window)
+        dialog.formula_duplicated.connect(window._on_formula_duplicated_from_history)
+        dialog.revisions_table.selectRow(0)
+        dialog._duplicate_selected_revision()
+        dialog.close()
+
+        recipes = repo.list_recipes()
+        self.assertEqual(len(recipes), 2)
+        self.assertTrue(any("(v1 Copy)" in rec.name for rec in recipes))
+
+    def test_archived_formulas_dialog_restores_and_preserves_dirty_editor(self) -> None:
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        r_active = Recipe(id="rec-act", name="Active Formula", ingredients=(Ingredient("A", Decimal("100.00")),))
+        r_arch = Recipe(id="rec-arch", name="Old Formula", ingredients=(Ingredient("B", Decimal("100.00")),))
+        repo.save_recipe(r_active)
+        repo.save_recipe(r_arch)
+        repo.delete_recipe("rec-arch")
+
+        window = MainWindow(repo)
+        self.addCleanup(window.close)
+        window.name_input.setText("Unsaved Active Edit")
+        self.assertTrue(window._is_dirty)
+
+        arch_dialog = ArchivedFormulasDialog(repo, parent=window)
+        arch_dialog.recipe_restored.connect(window._on_archived_recipe_restored)
+        self.assertEqual(arch_dialog.table.rowCount(), 1)
+        self.assertEqual(arch_dialog.table.item(0, 0).text(), "Old Formula")
+
+        self.mock_question.return_value = QMessageBox.StandardButton.Yes
+        arch_dialog._restore_selected()
+        arch_dialog.close()
+
+        self.assertIsNotNone(repo.get_recipe("rec-arch"))
+        self.assertEqual(window.recipe_list.count(), 2)
+        self.assertEqual(window.name_input.text(), "Unsaved Active Edit")
+        self.assertTrue(window._is_dirty)
 
 
 if __name__ == "__main__":

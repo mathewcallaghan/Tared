@@ -649,6 +649,45 @@ class SQLiteRecipeRepository(RecipeRepository):
             if not self._is_memory:
                 conn.close()
 
+    def list_archived_recipes(self) -> list[dict[str, Any]]:
+        """Retrieve archived recipe summaries ordered by most recently updated."""
+        conn = self._get_connection()
+        try:
+            rows = conn.execute(
+                """
+                SELECT
+                    r.id,
+                    r.name,
+                    r.description,
+                    r.version,
+                    r.updated_at,
+                    (SELECT COUNT(*) FROM ingredients i WHERE i.recipe_id = r.id) AS ingredient_count,
+                    (SELECT COUNT(*) FROM batches b WHERE b.recipe_id = r.id) AS batch_count,
+                    (SELECT COUNT(*) FROM recipe_revisions rv WHERE rv.recipe_id = r.id) AS revision_count
+                FROM recipes r
+                WHERE r.is_archived = 1
+                ORDER BY r.updated_at DESC, r.name ASC;
+                """
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            if not self._is_memory:
+                conn.close()
+
+    def restore_recipe(self, recipe_id: str) -> bool:
+        """Restore an archived recipe to the active library without altering its version history."""
+        conn = self._get_connection()
+        try:
+            with conn:
+                cursor = conn.execute(
+                    "UPDATE recipes SET is_archived = 0 WHERE id = ? AND is_archived = 1;",
+                    (recipe_id,),
+                )
+                return cursor.rowcount > 0
+        finally:
+            if not self._is_memory:
+                conn.close()
+
     def get_catalog_ingredient(self, name: str) -> CatalogIngredient | None:
         conn = self._get_connection()
         try:

@@ -190,6 +190,21 @@ class TestSQLiteRecipeRepository(unittest.TestCase):
         batches = self.repo.list_batches(self.recipe.id)
         self.assertEqual(len(batches), 1)
 
+        archived = self.repo.list_archived_recipes()
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(archived[0]["id"], self.recipe.id)
+        self.assertEqual(archived[0]["batch_count"], 1)
+        self.assertEqual(archived[0]["ingredient_count"], len(self.recipe.ingredients))
+
+        restored_ok = self.repo.restore_recipe(self.recipe.id)
+        self.assertTrue(restored_ok)
+        self.assertFalse(self.repo.restore_recipe(self.recipe.id))
+        self.assertEqual(len(self.repo.list_archived_recipes()), 0)
+        active = self.repo.get_recipe(self.recipe.id)
+        self.assertIsNotNone(active)
+        assert active is not None
+        self.assertEqual(active.version, 1)
+
     def test_migration_backfills_missing_revisions(self) -> None:
         conn = self.repo._get_connection()
         conn.execute(

@@ -40,6 +40,14 @@ class RecipeRepository(ABC):
         """Archive a recipe by ID while preserving audit revisions and batch runs."""
 
     @abstractmethod
+    def list_archived_recipes(self) -> list[dict[str, Any]]:
+        """Retrieve archived recipe summaries with ingredient, revision, and batch counts."""
+
+    @abstractmethod
+    def restore_recipe(self, recipe_id: str) -> bool:
+        """Restore an archived recipe back to the active formula library."""
+
+    @abstractmethod
     def get_recipe_revisions(self, recipe_id: str) -> list[dict[str, Any]]:
         """Retrieve historical immutable revision snapshots for a recipe."""
 

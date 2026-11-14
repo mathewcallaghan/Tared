@@ -1,6 +1,7 @@
 """UI Views and dialogs package."""
 
 from tared.ui.views.about_dialog import AboutDialog
+from tared.ui.views.archived_formulas_dialog import ArchivedFormulasDialog
 from tared.ui.views.batch_history_dialog import BatchHistoryDialog
 from tared.ui.views.catalog_dialog import CatalogManagerDialog
 from tared.ui.views.catalog_picker_dialog import CatalogPickerDialog
@@ -12,6 +13,7 @@ from tared.ui.views.update_dialog import UpdateDialog
 
 __all__ = [
     "AboutDialog",
+    "ArchivedFormulasDialog",
     "BatchHistoryDialog",
     "CatalogManagerDialog",
     "CatalogPickerDialog",

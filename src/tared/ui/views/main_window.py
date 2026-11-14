@@ -47,6 +47,7 @@ from tared.storage.json_repo import load_recipe_from_file, save_recipe_to_file
 from tared.storage.workspace_io import export_workspace_to_json_file
 from tared.ui.models.recipe_table_model import RecipeTableModel
 from tared.ui.views.about_dialog import AboutDialog
+from tared.ui.views.archived_formulas_dialog import ArchivedFormulasDialog
 from tared.ui.views.batch_history_dialog import BatchHistoryDialog
 from tared.ui.views.catalog_dialog import CatalogManagerDialog
 from tared.ui.views.catalog_picker_dialog import CatalogPickerDialog
@@ -194,6 +195,10 @@ class MainWindow(QMainWindow):
         side_btn_layout.addWidget(self.btn_new)
         side_btn_layout.addWidget(self.btn_delete)
         side_layout.addLayout(side_btn_layout)
+
+        self.btn_view_archive = QPushButton("View Archive...")
+        self.btn_view_archive.setToolTip("Browse and restore archived formulas")
+        side_layout.addWidget(self.btn_view_archive)
 
         self.btn_import = QPushButton("Import JSON")
         self.btn_export = QPushButton("Export JSON")
@@ -346,7 +351,8 @@ class MainWindow(QMainWindow):
         self.btn_save.setStyleSheet("font-weight: bold; padding: 6px 14px;")
         self.btn_print = QPushButton("Print Batch Sheet...")
         self.btn_print.setStyleSheet("padding: 6px 14px;")
-        self.btn_history = QPushButton("Batch History...")
+        self.btn_history = QPushButton("History...")
+        self.btn_history.setToolTip("View production batch logs and saved formula revisions")
         self.btn_history.setStyleSheet("padding: 6px 14px;")
         btn_box.addWidget(self.btn_save)
         btn_box.addWidget(self.btn_print)
@@ -362,6 +368,7 @@ class MainWindow(QMainWindow):
         self.recipe_list.currentRowChanged.connect(self._on_recipe_selected)
         self.btn_new.clicked.connect(self._create_new_recipe)
         self.btn_delete.clicked.connect(self._delete_current_recipe)
+        self.btn_view_archive.clicked.connect(self._open_archive_dialog)
         self.btn_save.clicked.connect(lambda: self._save_current_recipe())
         self.btn_import.clicked.connect(self._import_recipe)
         self.btn_export.clicked.connect(self._export_recipe)
@@ -1087,7 +1094,111 @@ class MainWindow(QMainWindow):
         active_recipe = self.repo.get_recipe(self._current_recipe_id)
         recipe_name = active_recipe.name if active_recipe else "Recipe"
         dialog = BatchHistoryDialog(self._current_recipe_id, recipe_name, self.repo, self)
+        dialog.revision_restored.connect(self._restore_revision_to_editor)
+        dialog.formula_duplicated.connect(self._on_formula_duplicated_from_history)
         dialog.exec()
+
+    def _open_archive_dialog(self) -> None:
+        dialog = ArchivedFormulasDialog(self.repo, self)
+        dialog.recipe_restored.connect(self._on_archived_recipe_restored)
+        dialog.formula_duplicated.connect(self._on_formula_duplicated_from_history)
+        dialog.exec()
+
+    def _refresh_sidebar_list_preserving_editor(self, select_id: str | None = None) -> None:
+        prev_switching = self._is_switching_recipe
+        self._is_switching_recipe = True
+        try:
+            self.recipe_list.clear()
+            recipes = self.repo.list_recipes()
+            selected_row = -1
+            for idx, r in enumerate(recipes):
+                item = QListWidgetItem(f"{r.name} (v{r.version})")
+                item.setData(Qt.ItemDataRole.UserRole, r.id)
+                self.recipe_list.addItem(item)
+                if select_id is not None and r.id == select_id:
+                    selected_row = idx
+
+            if hasattr(self.repo, "get_corrupted_recipes"):
+                for bad in self.repo.get_corrupted_recipes():
+                    item = QListWidgetItem(f"⚠ {bad['name']} [Corrupted]")
+                    item.setData(Qt.ItemDataRole.UserRole, bad["id"])
+                    item.setData(Qt.ItemDataRole.UserRole + 1, bad["error"])
+                    self.recipe_list.addItem(item)
+                    if select_id is not None and bad["id"] == select_id:
+                        selected_row = self.recipe_list.count() - 1
+
+            if selected_row >= 0:
+                self.recipe_list.setCurrentRow(selected_row)
+            else:
+                self.recipe_list.clearSelection()
+                self.recipe_list.setCurrentRow(-1)
+
+            if self.search_input.text().strip():
+                self._filter_recipes(self.search_input.text())
+        finally:
+            self._is_switching_recipe = prev_switching
+
+    def _on_archived_recipe_restored(self, recipe_id: str) -> None:
+        if self._is_dirty:
+            self._refresh_sidebar_list_preserving_editor(select_id=self._current_recipe_id)
+        else:
+            self._load_recipe_archive(select_id=recipe_id)
+        self._trigger_auto_backup(silent=True)
+        restored = self.repo.get_recipe(recipe_id)
+        label = restored.name if restored else recipe_id
+        self.statusBar().showMessage(f"Restored '{label}' to active library.", 3500)
+
+    def _on_formula_duplicated_from_history(self, new_recipe_id: str) -> None:
+        if self._is_dirty:
+            self._refresh_sidebar_list_preserving_editor(select_id=self._current_recipe_id)
+        else:
+            self._load_recipe_archive(select_id=new_recipe_id)
+        self._trigger_auto_backup(silent=True)
+        self.statusBar().showMessage("Duplicated revision as a new active formula.", 3500)
+
+    def _restore_revision_to_editor(self, rev_recipe: Recipe) -> None:
+        if self._is_dirty:
+            reply = QMessageBox.question(
+                self,
+                "Replace Unsaved Changes?",
+                f"You have unsaved changes in the editor.\n"
+                f"Replace editor contents with Revision v{rev_recipe.version}?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        existing = self.repo.get_recipe(rev_recipe.id, include_archived=True)
+        current_ver = existing.version if existing is not None else self.table_model.recipe_version
+
+        staged_recipe = Recipe(
+            id=rev_recipe.id,
+            name=rev_recipe.name,
+            description=rev_recipe.description,
+            version=current_ver,
+            updated_at=self.table_model.recipe_updated_at,
+            ingredients=rev_recipe.ingredients,
+        )
+
+        prev_switching = self._is_switching_recipe
+        self._is_switching_recipe = True
+        try:
+            self._current_recipe_id = staged_recipe.id
+            self.name_input.setText(staged_recipe.name)
+            self.desc_input.setText(staged_recipe.description)
+            self.rev_label.setText(
+                f"Revision: v{current_ver} (Restoring v{rev_recipe.version} — Save for v{current_ver + 1})"
+            )
+            self.sort_combo.setCurrentIndex(0)
+            self.table_model.load_recipe(staged_recipe, auto_sort=False)
+        finally:
+            self._is_switching_recipe = prev_switching
+
+        self._set_dirty(True)
+        self.statusBar().showMessage(
+            f"Loaded Revision v{rev_recipe.version} into editor. Click 'Save Formula' to commit.", 4500
+        )
 
     def _open_print_dialog(self) -> None:
         active_id = self.table_model.recipe_id
@@ -1242,9 +1353,13 @@ class MainWindow(QMainWindow):
         action_catalog.setShortcut("Ctrl+M")
         action_catalog.triggered.connect(self._open_catalog_dialog)
 
-        action_history = tools_menu.addAction("Production &Batch History...")
+        action_history = tools_menu.addAction("Formula && &Batch History...")
         action_history.setShortcut("Ctrl+H")
         action_history.triggered.connect(self._open_batch_history_dialog)
+
+        action_archive = tools_menu.addAction("&Archived Formulas...")
+        action_archive.setShortcut("Ctrl+Shift+A")
+        action_archive.triggered.connect(self._open_archive_dialog)
 
         # 3. Help Menu
         help_menu = menubar.addMenu("&Help")

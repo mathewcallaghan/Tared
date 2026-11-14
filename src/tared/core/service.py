@@ -6,13 +6,82 @@ import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal
-from typing import TYPE_CHECKING
+from decimal import Decimal, InvalidOperation
+from typing import TYPE_CHECKING, Any
 
+from tared.core.formatting import format_currency, format_percentage
 from tared.core.models import CatalogIngredient, Ingredient, Recipe
 
 if TYPE_CHECKING:
     from tared.storage.base import RecipeRepository
+
+
+def summarize_revision_diff(previous: dict[str, Any] | None, current: dict[str, Any]) -> str:
+    """Produce a concise summary of formulation changes between two revision snapshots."""
+    if previous is None:
+        return "Initial saved formulation"
+
+    changes: list[str] = []
+    prev_name = str(previous.get("name", ""))
+    curr_name = str(current.get("name", ""))
+    if prev_name != curr_name:
+        changes.append(f"Renamed to '{curr_name}'")
+
+    prev_desc = str(previous.get("description") or "")
+    curr_desc = str(current.get("description") or "")
+    if prev_desc != curr_desc:
+        changes.append("Updated description/SOP")
+
+    try:
+        prev_items = json.loads(str(previous.get("ingredients_json", "[]")))
+        curr_items = json.loads(str(current.get("ingredients_json", "[]")))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return "; ".join(changes) if changes else "Revision snapshot"
+
+    if not isinstance(prev_items, list) or not isinstance(curr_items, list):
+        return "; ".join(changes) if changes else "Revision snapshot"
+
+    prev_map = {str(it.get("name", "")).strip().lower(): it for it in prev_items if isinstance(it, dict)}
+    curr_map = {str(it.get("name", "")).strip().lower(): it for it in curr_items if isinstance(it, dict)}
+
+    for key, p_it in prev_map.items():
+        if key not in curr_map:
+            changes.append(f"Removed {str(p_it.get('name', '')).strip()}")
+
+    for key, c_it in curr_map.items():
+        c_name = str(c_it.get("name", "")).strip()
+        try:
+            c_pct = Decimal(str(c_it.get("percentage", "0")))
+            c_cost = Decimal(str(c_it.get("cost_per_unit", "0.00")))
+        except (InvalidOperation, ValueError):
+            continue
+
+        if key not in prev_map:
+            changes.append(f"Added {c_name} ({format_percentage(c_pct)}%)")
+            continue
+
+        p_it = prev_map[key]
+        try:
+            p_pct = Decimal(str(p_it.get("percentage", "0")))
+            p_cost = Decimal(str(p_it.get("cost_per_unit", "0.00")))
+        except (InvalidOperation, ValueError):
+            continue
+
+        if p_pct != c_pct:
+            changes.append(f"{c_name}: {format_percentage(p_pct)}% → {format_percentage(c_pct)}%")
+        if p_cost != c_cost:
+            changes.append(f"{c_name} cost: {format_currency(p_cost)} → {format_currency(c_cost)}/kg")
+
+    prev_order = [str(it.get("name", "")).strip().lower() for it in prev_items if isinstance(it, dict)]
+    curr_order = [str(it.get("name", "")).strip().lower() for it in curr_items if isinstance(it, dict)]
+    if prev_order != curr_order and set(prev_order) == set(curr_order):
+        changes.append("Reordered ingredients")
+
+    if not changes:
+        return "No formulation changes"
+    if len(changes) > 3:
+        return "; ".join(changes[:3]) + f"; +{len(changes) - 3} more"
+    return "; ".join(changes)
 
 
 def has_formulation_changed(existing: Recipe, candidate: Recipe) -> bool:

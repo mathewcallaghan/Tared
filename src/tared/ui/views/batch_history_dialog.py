@@ -1,33 +1,46 @@
-"""Dialog displaying historical batch run records with lossless PDF reprinting capability."""
+"""Dialog displaying production batch runs and historical formula revisions (v1..vN)."""
 
+from __future__ import annotations
+
+import html
 import json
 import re
+import uuid
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDialog,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
+    QLabel,
     QMessageBox,
     QPushButton,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
+    QWidget,
 )
 
-from tared.core.models import BatchItem, BatchResult
+from tared.core.formatting import format_currency, format_percentage
+from tared.core.models import BatchItem, BatchResult, Ingredient, Recipe
+from tared.core.service import RecipeService, summarize_revision_diff
 from tared.printing.renderer import export_batch_sheet_to_pdf
 from tared.storage.base import RecipeRepository
 
 
 class BatchHistoryDialog(QDialog):
-    """Modal dialog displaying logged production batches and allowing re-exporting of batch sheets."""
+    """Two-tab history dialog for Production Batches (reprintable) and Formula Revisions."""
+
+    revision_restored = pyqtSignal(object)
+    formula_duplicated = pyqtSignal(str)
 
     def __init__(
         self,
@@ -35,20 +48,34 @@ class BatchHistoryDialog(QDialog):
         recipe_name: str,
         repository: RecipeRepository,
         parent: Any = None,
+        allow_restore: bool = True,
     ) -> None:
         super().__init__(parent)
         self.recipe_id = recipe_id
         self.recipe_name = recipe_name
         self.repo = repository
-        self.setWindowTitle(f"Production Batch History - {recipe_name}")
-        self.resize(880, 480)
+        self.allow_restore = allow_restore
+        self.setWindowTitle(f"Formula & Batch History - {recipe_name}")
+        self.resize(940, 580)
 
         self._batches: list[dict[str, Any]] = []
+        self._revisions: list[dict[str, Any]] = []
         self._setup_ui()
         self._load_batches()
+        self._load_revisions()
+
+        if not self._batches and self._revisions:
+            self.tabs.setCurrentIndex(1)
 
     def _setup_ui(self) -> None:
         layout = QVBoxLayout(self)
+
+        self.tabs = QTabWidget()
+        layout.addWidget(self.tabs)
+
+        # Tab 1: Production Batches
+        batches_tab = QWidget()
+        batches_layout = QVBoxLayout(batches_tab)
 
         self.table = QTableWidget()
         self.table.setColumnCount(7)
@@ -76,28 +103,108 @@ class BatchHistoryDialog(QDialog):
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
 
-        layout.addWidget(self.table)
+        batches_layout.addWidget(self.table)
 
-        btn_layout = QHBoxLayout()
+        batch_btn_layout = QHBoxLayout()
         self.btn_reprint = QPushButton("Reprint Selected Batch...")
         self.btn_reprint.setStyleSheet("font-weight: bold; padding: 6px 14px;")
         self.btn_reprint.setEnabled(False)
+        batch_btn_layout.addStretch()
+        batch_btn_layout.addWidget(self.btn_reprint)
+        batches_layout.addLayout(batch_btn_layout)
 
+        self.tabs.addTab(batches_tab, "Production Batches")
+
+        # Tab 2: Formula Revisions
+        revisions_tab = QWidget()
+        revisions_layout = QVBoxLayout(revisions_tab)
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        revisions_layout.addWidget(splitter)
+
+        self.revisions_table = QTableWidget()
+        self.revisions_table.setColumnCount(5)
+        self.revisions_table.setHorizontalHeaderLabels(
+            [
+                "Rev",
+                "Saved Date",
+                "Formula Name",
+                "Ingredients",
+                "Changes vs. Previous",
+            ]
+        )
+        self.revisions_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.revisions_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.revisions_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+
+        rev_header = self.revisions_table.horizontalHeader()
+        rev_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        rev_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        rev_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        rev_header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        rev_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        splitter.addWidget(self.revisions_table)
+
+        detail_widget = QWidget()
+        detail_layout = QVBoxLayout(detail_widget)
+        detail_layout.setContentsMargins(0, 4, 0, 0)
+
+        self.rev_detail_label = QLabel("Select a revision above to inspect its formulation snapshot.")
+        self.rev_detail_label.setWordWrap(True)
+        self.rev_detail_label.setStyleSheet("font-size: 9pt; color: #334155; padding: 4px 2px;")
+        detail_layout.addWidget(self.rev_detail_label)
+
+        self.rev_ingredients_table = QTableWidget()
+        self.rev_ingredients_table.setColumnCount(3)
+        self.rev_ingredients_table.setHorizontalHeaderLabels(["Ingredient", "Formula %", "Unit Cost ($/kg)"])
+        self.rev_ingredients_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.rev_ingredients_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        ing_header = self.rev_ingredients_table.horizontalHeader()
+        ing_header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        ing_header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        ing_header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        detail_layout.addWidget(self.rev_ingredients_table)
+
+        splitter.addWidget(detail_widget)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+
+        rev_btn_layout = QHBoxLayout()
+        self.btn_restore_revision = QPushButton("Restore Revision to Editor")
+        self.btn_restore_revision.setStyleSheet("font-weight: bold; padding: 6px 14px;")
+        self.btn_restore_revision.setEnabled(False)
+        self.btn_restore_revision.setVisible(self.allow_restore)
+
+        self.btn_duplicate_revision = QPushButton("Duplicate as New Formula")
+        self.btn_duplicate_revision.setStyleSheet("padding: 6px 14px;")
+        self.btn_duplicate_revision.setEnabled(False)
+
+        rev_btn_layout.addStretch()
+        rev_btn_layout.addWidget(self.btn_duplicate_revision)
+        rev_btn_layout.addWidget(self.btn_restore_revision)
+        revisions_layout.addLayout(rev_btn_layout)
+
+        self.tabs.addTab(revisions_tab, "Formula Revisions")
+
+        footer_layout = QHBoxLayout()
         self.btn_close = QPushButton("Close")
         self.btn_close.setStyleSheet("padding: 6px 14px;")
-
-        btn_layout.addStretch()
-        btn_layout.addWidget(self.btn_reprint)
-        btn_layout.addWidget(self.btn_close)
-        layout.addLayout(btn_layout)
+        footer_layout.addStretch()
+        footer_layout.addWidget(self.btn_close)
+        layout.addLayout(footer_layout)
 
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         self.table.itemDoubleClicked.connect(lambda: self._reprint_selected_batch())
         self.btn_reprint.clicked.connect(self._reprint_selected_batch)
+
+        self.revisions_table.itemSelectionChanged.connect(self._on_revision_selection_changed)
+        self.btn_restore_revision.clicked.connect(self._restore_selected_revision)
+        self.btn_duplicate_revision.clicked.connect(self._duplicate_selected_revision)
         self.btn_close.clicked.connect(self.accept)
 
     def _load_batches(self) -> None:
         self._batches = self.repo.list_batches(recipe_id=self.recipe_id)
+        self.tabs.setTabText(0, f"Production Batches ({len(self._batches)})")
         self.table.setRowCount(len(self._batches))
 
         for row, b in enumerate(self._batches):
@@ -123,8 +230,156 @@ class BatchHistoryDialog(QDialog):
         if self._batches:
             self.table.selectRow(0)
 
+    def _load_revisions(self) -> None:
+        self._revisions = self.repo.get_recipe_revisions(self.recipe_id)
+        self.tabs.setTabText(1, f"Formula Revisions ({len(self._revisions)})")
+        self.revisions_table.setRowCount(len(self._revisions))
+
+        for row, rev in enumerate(self._revisions):
+            prev_rev = self._revisions[row + 1] if row + 1 < len(self._revisions) else None
+            diff_summary = summarize_revision_diff(prev_rev, rev)
+
+            try:
+                ing_items = json.loads(rev.get("ingredients_json", "[]"))
+                ing_count = len(ing_items) if isinstance(ing_items, list) else 0
+            except (json.JSONDecodeError, TypeError):
+                ing_count = 0
+
+            item_ver = QTableWidgetItem(f"v{rev.get('version', 1)}")
+            item_ver.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            item_date = QTableWidgetItem(rev.get("created_at", "") or "—")
+            item_name = QTableWidgetItem(rev.get("name", ""))
+            item_count = QTableWidgetItem(str(ing_count))
+            item_count.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            item_diff = QTableWidgetItem(diff_summary)
+
+            self.revisions_table.setItem(row, 0, item_ver)
+            self.revisions_table.setItem(row, 1, item_date)
+            self.revisions_table.setItem(row, 2, item_name)
+            self.revisions_table.setItem(row, 3, item_count)
+            self.revisions_table.setItem(row, 4, item_diff)
+
+        if self._revisions:
+            self.revisions_table.selectRow(0)
+
     def _on_selection_changed(self) -> None:
         self.btn_reprint.setEnabled(len(self.table.selectedItems()) > 0)
+
+    def _on_revision_selection_changed(self) -> None:
+        selected = self.revisions_table.selectionModel().selectedRows()
+        has_sel = len(selected) > 0
+        self.btn_restore_revision.setEnabled(has_sel and self.allow_restore)
+        self.btn_duplicate_revision.setEnabled(has_sel)
+
+        if not has_sel:
+            self.rev_detail_label.setText("Select a revision above to inspect its formulation snapshot.")
+            self.rev_ingredients_table.setRowCount(0)
+            return
+
+        row = selected[0].row()
+        rev = self._revisions[row]
+        escaped_name = html.escape(str(rev.get("name", "")))
+        raw_desc = (rev.get("description") or "").strip() or "No description / SOP recorded."
+        escaped_desc = html.escape(raw_desc)
+        self.rev_detail_label.setText(
+            f"<b>Revision v{rev.get('version', 1)} — {escaped_name}</b><br>"
+            f"<b>SOP / Description:</b> {escaped_desc}"
+        )
+
+        try:
+            items = json.loads(rev.get("ingredients_json", "[]"))
+            if not isinstance(items, list):
+                items = []
+        except (json.JSONDecodeError, TypeError):
+            items = []
+
+        self.rev_ingredients_table.setRowCount(len(items))
+        for i_row, it in enumerate(items):
+            name = str(it.get("name", ""))
+            try:
+                pct_str = f"{format_percentage(Decimal(str(it.get('percentage', '0'))))}%"
+            except (InvalidOperation, ValueError):
+                pct_str = str(it.get("percentage", "0"))
+            try:
+                cost_str = format_currency(Decimal(str(it.get("cost_per_unit", "0.00"))))
+            except (InvalidOperation, ValueError):
+                cost_str = str(it.get("cost_per_unit", "0.00"))
+
+            name_item = QTableWidgetItem(name)
+            pct_item = QTableWidgetItem(pct_str)
+            pct_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            cost_item = QTableWidgetItem(cost_str)
+            cost_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+            self.rev_ingredients_table.setItem(i_row, 0, name_item)
+            self.rev_ingredients_table.setItem(i_row, 1, pct_item)
+            self.rev_ingredients_table.setItem(i_row, 2, cost_item)
+
+    def _build_recipe_from_revision(self, rev: dict[str, Any]) -> Recipe:
+        raw_items = json.loads(rev.get("ingredients_json", "[]"))
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ValueError("Revision snapshot contains no ingredients.")
+
+        ingredients = tuple(
+            Ingredient(
+                name=str(it["name"]),
+                percentage=Decimal(str(it["percentage"])),
+                cost_per_unit=Decimal(str(it.get("cost_per_unit", "0.00"))),
+            )
+            for it in raw_items
+        )
+        return Recipe(
+            id=self.recipe_id,
+            name=str(rev.get("name", self.recipe_name)),
+            description=str(rev.get("description") or ""),
+            version=int(rev.get("version", 1)),
+            updated_at=str(rev.get("created_at") or ""),
+            ingredients=ingredients,
+        )
+
+    def _restore_selected_revision(self) -> None:
+        if not self.allow_restore:
+            return
+        selected = self.revisions_table.selectionModel().selectedRows()
+        if not selected:
+            return
+
+        rev = self._revisions[selected[0].row()]
+        try:
+            rev_recipe = self._build_recipe_from_revision(rev)
+        except (json.JSONDecodeError, KeyError, InvalidOperation, ValueError, TypeError) as err:
+            QMessageBox.critical(self, "Revision Error", f"Could not load revision snapshot:\n{err}")
+            return
+
+        self.revision_restored.emit(rev_recipe)
+        self.accept()
+
+    def _duplicate_selected_revision(self) -> None:
+        selected = self.revisions_table.selectionModel().selectedRows()
+        if not selected:
+            return
+
+        rev = self._revisions[selected[0].row()]
+        try:
+            rev_recipe = self._build_recipe_from_revision(rev)
+            new_recipe = Recipe(
+                id=str(uuid.uuid4()),
+                name=f"{rev_recipe.name} (v{rev_recipe.version} Copy)",
+                description=rev_recipe.description,
+                version=1,
+                ingredients=rev_recipe.ingredients,
+            )
+            saved = RecipeService(self.repo).save_recipe(new_recipe)
+        except (json.JSONDecodeError, KeyError, InvalidOperation, ValueError, TypeError) as err:
+            QMessageBox.critical(self, "Duplicate Error", f"Could not duplicate revision:\n{err}")
+            return
+
+        self.formula_duplicated.emit(saved.id)
+        QMessageBox.information(
+            self,
+            "Formula Duplicated",
+            f"Revision v{rev_recipe.version} was duplicated into the active library as:\n'{saved.name}' (v1).",
+        )
 
     def _reprint_selected_batch(self) -> None:
         selected_indexes = self.table.selectionModel().selectedRows()
@@ -136,7 +391,6 @@ class BatchHistoryDialog(QDialog):
         batch_num = batch_record.get("batch_number", "UNASSIGNED")
         recipe_ver = int(batch_record.get("recipe_version", 1))
 
-        # 1. Recover historical formulation metadata from revision snapshot
         rev_snapshot = None
         if hasattr(self.repo, "get_recipe_revision"):
             rev_snapshot = self.repo.get_recipe_revision(self.recipe_id, recipe_ver)
@@ -176,7 +430,6 @@ class BatchHistoryDialog(QDialog):
             high_dev = []
             zero_wt = []
 
-            # 2. Reconstruct items and calculate exact discrete allocation deviation
             for it in items_raw:
                 pct = Decimal(str(it.get("percentage", "0")))
                 scaled_w = Decimal(str(it.get("scaled_weight", "0")))
@@ -225,7 +478,6 @@ class BatchHistoryDialog(QDialog):
                 max_allocation_deviation=max_dev,
             )
 
-            # 3. Transparent reprint audit timestamp
             reprint_local_time = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M %Z")
             timestamp_note = f"{batch_record.get('created_at', '')} [Reprinted: {reprint_local_time}]"
 
