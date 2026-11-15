@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import html
+import logging
 import re
+from decimal import InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -27,8 +30,8 @@ from PyQt6.QtWidgets import (
 from tared.config import ConfigManager
 from tared.core.models import Recipe
 from tared.core.service import RecipeService
+from tared.storage.base import RecipeRepository
 from tared.storage.json_repo import load_recipe_from_file, save_recipe_to_file
-from tared.storage.sqlite_repo import SQLiteRecipeRepository
 from tared.storage.workspace_io import (
     export_catalog_to_json_file,
     export_workspace_to_json_file,
@@ -47,7 +50,7 @@ class DataTransferDialog(QDialog):
 
     def __init__(
         self,
-        repository: SQLiteRecipeRepository,
+        repository: RecipeRepository,
         service: RecipeService,
         config: ConfigManager | None = None,
         parent: Any = None,
@@ -214,11 +217,22 @@ class DataTransferDialog(QDialog):
     def _get_start_dir(self) -> str:
         return str(self.config.get_resolved_export_dir())
 
+    def _trigger_auto_backup(self) -> None:
+        if self.config.should_attempt_backup() and not getattr(self.repo, "_is_memory", False):
+            try:
+                target_file = self.config.resolve_backup_target()
+                export_workspace_to_json_file(self.repo, target_file, max_rotations=3)
+                self.config.record_backup_result(True)
+            except Exception as bk_err:
+                logging.getLogger(__name__).warning("Automated backup after data transfer failed: %s", bk_err)
+                self.config.record_backup_result(False, str(bk_err))
+
     def _populate_recipes(self) -> None:
         self.recipe_list.clear()
         self._all_recipes = self.repo.list_recipes()
         for r in self._all_recipes:
-            item = QListWidgetItem(f"{r.name} (v{r.version})")
+            draft_suffix = " Draft" if r.is_draft else ""
+            item = QListWidgetItem(f"{r.name} (v{r.version}{draft_suffix})")
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Unchecked)
             item.setData(Qt.ItemDataRole.UserRole, r)
@@ -229,26 +243,32 @@ class DataTransferDialog(QDialog):
         query = text.strip().lower()
         for i in range(self.recipe_list.count()):
             item = self.recipe_list.item(i)
-            item.setHidden(query not in item.text().lower())
+            if item is not None:
+                item.setHidden(query not in item.text().lower())
 
     def _select_all_recipes(self) -> None:
         for i in range(self.recipe_list.count()):
             item = self.recipe_list.item(i)
-            if not item.isHidden():
+            if item is not None and not item.isHidden():
                 item.setCheckState(Qt.CheckState.Checked)
         self._on_recipe_selection_changed()
 
     def _clear_recipe_selection(self) -> None:
         for i in range(self.recipe_list.count()):
-            self.recipe_list.item(i).setCheckState(Qt.CheckState.Unchecked)
+            item = self.recipe_list.item(i)
+            if item is not None:
+                item.setCheckState(Qt.CheckState.Unchecked)
         self._on_recipe_selection_changed()
 
     def _on_recipe_selection_changed(self) -> None:
-        count = sum(
-            1 for i in range(self.recipe_list.count()) if self.recipe_list.item(i).checkState() == Qt.CheckState.Checked
-        )
+        count = 0
+        for i in range(self.recipe_list.count()):
+            item = self.recipe_list.item(i)
+            if item is not None and item.checkState() == Qt.CheckState.Checked:
+                count += 1
         self.btn_export_selected.setEnabled(count > 0)
-        self.btn_export_selected.setText(f"Export Selected ({count})..." if count > 0 else "Export Selected Recipes...")
+        label = f"Export Selected ({count})..." if count > 0 else "Export Selected Formulas..."
+        self.btn_export_selected.setText(label)
 
     def _export_workspace(self) -> None:
         target, _ = QFileDialog.getSaveFileName(
@@ -259,6 +279,8 @@ class DataTransferDialog(QDialog):
         )
         if not target:
             return
+        if not target.lower().endswith(".json"):
+            target = f"{target}.json"
 
         try:
             out_path = export_workspace_to_json_file(self.repo, target)
@@ -279,6 +301,8 @@ class DataTransferDialog(QDialog):
         )
         if not target:
             return
+        if not target.lower().endswith(".json"):
+            target = f"{target}.json"
 
         try:
             out_path = export_catalog_to_json_file(self.repo, target)
@@ -294,7 +318,7 @@ class DataTransferDialog(QDialog):
         selected_recipes: list[Recipe] = []
         for i in range(self.recipe_list.count()):
             item = self.recipe_list.item(i)
-            if item.checkState() == Qt.CheckState.Checked:
+            if item is not None and item.checkState() == Qt.CheckState.Checked:
                 r = item.data(Qt.ItemDataRole.UserRole)
                 if isinstance(r, Recipe):
                     selected_recipes.append(r)
@@ -313,6 +337,8 @@ class DataTransferDialog(QDialog):
             )
             if not target:
                 return
+            if not target.lower().endswith(".json"):
+                target = f"{target}.json"
             try:
                 save_recipe_to_file(rec, target)
                 QMessageBox.information(self, "Export Complete", f"Exported '{rec.name}' to:\n{target}")
@@ -329,11 +355,33 @@ class DataTransferDialog(QDialog):
 
             saved_count = 0
             dest_path = Path(dest_dir)
+            base_names = []
+            for rec in selected_recipes:
+                clean_name = re.sub(r'[\/*?:"<>| ]', "_", rec.name)
+                base_names.append(f"{clean_name}_v{rec.version}")
+            name_counts: dict[str, int] = {}
+            for base in base_names:
+                name_counts[base] = name_counts.get(base, 0) + 1
+
+            used_paths: set[Path] = set()
             try:
-                for rec in selected_recipes:
-                    clean_name = re.sub(r"[\/*?:\"<>| ]", "_", rec.name)
-                    file_name = f"{clean_name}_v{rec.version}.json"
-                    save_recipe_to_file(rec, dest_path / file_name)
+                for rec, base in zip(selected_recipes, base_names):
+                    if name_counts[base] > 1:
+                        short_id = re.sub(r"[^A-Za-z0-9_-]", "", rec.id)[:8] or "dup"
+                        candidate = dest_path / f"{base}_{short_id}.json"
+                    else:
+                        candidate = dest_path / f"{base}.json"
+                        if candidate in used_paths or candidate.exists() or candidate.is_symlink():
+                            short_id = re.sub(r"[^A-Za-z0-9_-]", "", rec.id)[:8] or "dup"
+                            candidate = dest_path / f"{base}_{short_id}.json"
+                    if candidate in used_paths or candidate.exists() or candidate.is_symlink():
+                        short_id = re.sub(r"[^A-Za-z0-9_-]", "", rec.id)[:8] or "dup"
+                        suffix = 2
+                        while candidate in used_paths or candidate.exists() or candidate.is_symlink():
+                            candidate = dest_path / f"{base}_{short_id}_{suffix}.json"
+                            suffix += 1
+                    used_paths.add(candidate)
+                    save_recipe_to_file(rec, candidate)
                     saved_count += 1
 
                 QMessageBox.information(
@@ -396,6 +444,7 @@ class DataTransferDialog(QDialog):
                 "Restoration Successful",
                 f"Workspace was restored successfully!{note}",
             )
+            self._trigger_auto_backup()
             self._populate_recipes()
             self.workspace_restored.emit()
         except Exception as err:
@@ -415,14 +464,18 @@ class DataTransferDialog(QDialog):
         for f in file_paths:
             try:
                 recipe = load_recipe_from_file(f)
-                existing = self.repo.get_recipe(recipe.id, include_archived=True)
+                try:
+                    existing = self.repo.get_recipe(recipe.id, include_archived=True)
+                    has_collision = existing is not None
+                except (ValueError, InvalidOperation):
+                    has_collision = True
                 collision_mode = "copy"
 
-                if existing is not None:
+                if has_collision:
                     reply = QMessageBox.question(
                         self,
                         "Formula Collision",
-                        f"Formula '{recipe.name}' (id: {recipe.id}) already exists.<br><br>"
+                        f"Formula '{html.escape(recipe.name)}' (id: {html.escape(recipe.id)}) already exists.<br><br>"
                         f"Choose 'Yes' to import as a new copy, or 'No' to overwrite.",
                         QMessageBox.StandardButton.Yes
                         | QMessageBox.StandardButton.No
@@ -439,6 +492,7 @@ class DataTransferDialog(QDialog):
                 QMessageBox.critical(self, "Import Error", f"Failed to import '{f}':\n{err}")
 
         if imported_count > 0:
+            self._trigger_auto_backup()
             QMessageBox.information(
                 self,
                 "Import Complete",
@@ -459,6 +513,7 @@ class DataTransferDialog(QDialog):
 
         try:
             count = import_catalog_from_json_file(self.repo, file_path)
+            self._trigger_auto_backup()
             QMessageBox.information(
                 self,
                 "Catalog Imported",
@@ -512,10 +567,16 @@ class DataTransferDialog(QDialog):
         try:
             backup_path = self.repo.reset_workspace_data()
             note = f"\n\nA safety backup was preserved at:\n{backup_path}" if backup_path else ""
+            cloud_note = ""
+            if self.config.should_attempt_backup() and not getattr(self.repo, "_is_memory", False):
+                cloud_note = (
+                    "\n\nYour existing cloud sync backup file was left untouched "
+                    "(it will update on next save or application exit)."
+                )
             QMessageBox.information(
                 self,
                 "Workspace Reset Complete",
-                f"Workspace has been reset to a clean empty slate.{note}",
+                f"Workspace has been reset to a clean empty slate.{note}{cloud_note}",
             )
             self._populate_recipes()
             self.workspace_restored.emit()

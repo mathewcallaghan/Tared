@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
+from tared.core.calculator import validate_recipe_percentages
 from tared.core.formatting import format_currency, format_percentage
 from tared.core.models import CatalogIngredient, Ingredient, Recipe
 
@@ -50,9 +51,11 @@ def summarize_revision_diff(previous: dict[str, Any] | None, current: dict[str, 
 
     for key, c_it in curr_map.items():
         c_name = str(c_it.get("name", "")).strip()
+        raw_c_pct = c_it.get("percentage")
+        raw_c_cost = c_it.get("cost_per_unit")
         try:
-            c_pct = Decimal(str(c_it.get("percentage", "0")))
-            c_cost = Decimal(str(c_it.get("cost_per_unit", "0.00")))
+            c_pct = Decimal(str(raw_c_pct if raw_c_pct is not None else "0"))
+            c_cost = Decimal(str(raw_c_cost if raw_c_cost is not None else "0.00"))
         except (InvalidOperation, ValueError):
             continue
 
@@ -61,9 +64,14 @@ def summarize_revision_diff(previous: dict[str, Any] | None, current: dict[str, 
             continue
 
         p_it = prev_map[key]
+        p_name = str(p_it.get("name", "")).strip()
+        if p_name != c_name:
+            changes.append(f"Renamed '{p_name}' → '{c_name}'")
+        raw_p_pct = p_it.get("percentage")
+        raw_p_cost = p_it.get("cost_per_unit")
         try:
-            p_pct = Decimal(str(p_it.get("percentage", "0")))
-            p_cost = Decimal(str(p_it.get("cost_per_unit", "0.00")))
+            p_pct = Decimal(str(raw_p_pct if raw_p_pct is not None else "0"))
+            p_cost = Decimal(str(raw_p_cost if raw_p_cost is not None else "0.00"))
         except (InvalidOperation, ValueError):
             continue
 
@@ -108,7 +116,13 @@ class RecipeService:
 
     def compute_next_version(self, candidate: Recipe) -> int:
         """Determine next recipe version based on draft state and formulation changes."""
-        existing = self.repository.get_recipe(candidate.id, include_archived=True)
+        try:
+            existing = self.repository.get_recipe(candidate.id, include_archived=True)
+        except (ValueError, InvalidOperation):
+            revisions = self.repository.get_recipe_revisions(candidate.id)
+            if revisions:
+                return max(int(rev["version"]) for rev in revisions) + 1
+            return 1
         if existing is None:
             return 1
 
@@ -137,14 +151,16 @@ class RecipeService:
                             Ingredient(
                                 name=it["name"],
                                 percentage=Decimal(str(it["percentage"])),
-                                cost_per_unit=Decimal(str(it.get("cost_per_unit", "0.00"))),
+                                cost_per_unit=Decimal(
+                                    str(it.get("cost_per_unit") if it.get("cost_per_unit") is not None else "0.00")
+                                ),
                             )
                             for it in rev_items
                         ),
                     )
                     if has_formulation_changed(rev_recipe, candidate):
                         return existing.version + 1
-                except (json.JSONDecodeError, KeyError, ValueError, TypeError):
+                except (json.JSONDecodeError, KeyError, InvalidOperation, ValueError, TypeError):
                     pass
                 break
 
@@ -152,6 +168,8 @@ class RecipeService:
 
     def prepare_recipe_for_save(self, candidate: Recipe, timestamp: str | None = None) -> Recipe:
         """Assign version and timestamp, returning updated Recipe instance ready for persistence."""
+        if not candidate.is_draft:
+            validate_recipe_percentages(candidate)
         version = self.compute_next_version(candidate)
         if timestamp is None:
             timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -173,7 +191,7 @@ class RecipeService:
 
     def discard_draft(self, recipe_id: str) -> Recipe | None:
         """Revert an unreleased draft formula back to its latest committed revision snapshot."""
-        existing = self.repository.get_recipe(recipe_id, include_archived=True)
+        existing = self.repository.get_recipe(recipe_id, include_archived=False)
         if existing is None or not existing.is_draft:
             raise ValueError("Only an active draft formula can be discarded.")
 
@@ -194,7 +212,9 @@ class RecipeService:
                 Ingredient(
                     name=it["name"],
                     percentage=Decimal(str(it["percentage"])),
-                    cost_per_unit=Decimal(str(it.get("cost_per_unit", "0.00"))),
+                    cost_per_unit=Decimal(
+                        str(it.get("cost_per_unit") if it.get("cost_per_unit") is not None else "0.00")
+                    ),
                 )
                 for it in rev_items
             ),
@@ -213,8 +233,10 @@ class RecipeService:
         new_ingredients = []
         cat_map = self.repository.get_catalog_ingredients_map()
 
+        _ascii_nocase = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
         for ing in recipe.ingredients:
-            cat_item = cat_map.get(ing.name.strip().lower())
+            key = ing.name.strip().translate(_ascii_nocase)
+            cat_item = cat_map.get(key)
             if cat_item is not None and cat_item.cost_per_unit != ing.cost_per_unit:
                 changes.append((ing.name, ing.cost_per_unit, cat_item.cost_per_unit))
                 new_ingredients.append(
@@ -356,12 +378,27 @@ class RecipeService:
         timestamp: str | None = None,
     ) -> Recipe:
         """Prepare an imported recipe for persistence, resolving versioning and ID collisions."""
+        if not candidate.is_draft:
+            validate_recipe_percentages(candidate)
         if timestamp is None:
             timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        existing = self.repository.get_recipe(candidate.id, include_archived=True)
+        corrupted_match: dict[str, Any] | None = None
+        try:
+            existing = self.repository.get_recipe(candidate.id, include_archived=True)
+        except (ValueError, InvalidOperation):
+            existing = None
+            corrupt_pool = (
+                self.repository.get_corrupted_recipes(include_archived=True)
+                if hasattr(self.repository, "get_corrupted_recipes")
+                else []
+            )
+            corrupted_match = next(
+                (b for b in corrupt_pool if b.get("id") == candidate.id),
+                {"id": candidate.id, "name": "Corrupted Formula"},
+            )
 
-        if existing is not None:
+        if existing is not None or corrupted_match is not None:
             if collision_mode == "copy":
                 return Recipe(
                     id=str(uuid.uuid4()),
@@ -373,9 +410,14 @@ class RecipeService:
                     ingredients=candidate.ingredients,
                 )
             if collision_mode == "overwrite":
-                next_ver = max(existing.version, candidate.version) + 1
+                if existing is not None:
+                    base_ver = existing.version
+                else:
+                    revs = self.repository.get_recipe_revisions(candidate.id)
+                    base_ver = max((int(rev["version"]) for rev in revs), default=0)
+                next_ver = max(base_ver, candidate.version) + 1
                 return Recipe(
-                    id=existing.id,
+                    id=candidate.id,
                     name=candidate.name,
                     description=candidate.description,
                     version=next_ver,
@@ -383,9 +425,13 @@ class RecipeService:
                     is_draft=candidate.is_draft,
                     ingredients=candidate.ingredients,
                 )
-            raise ValueError(
-                f"Recipe with ID '{candidate.id}' already exists as '{existing.name}' (v{existing.version})."
-            )
+            if existing is not None:
+                existing_label = f"'{existing.name}' (v{existing.version})"
+            elif corrupted_match is not None:
+                existing_label = f"'{corrupted_match.get('name', 'Corrupted')}' (corrupted)"
+            else:
+                existing_label = "'Unknown' (corrupted)"
+            raise ValueError(f"Recipe with ID '{candidate.id}' already exists as {existing_label}.")
 
         return Recipe(
             id=candidate.id or str(uuid.uuid4()),

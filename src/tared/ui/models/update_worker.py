@@ -15,8 +15,47 @@ from tared.core.updater import (
     fetch_latest_release_info,
     get_current_appimage_path,
     is_safe_update_url,
+    open_safe_update_url,
     verify_binary_payload,
 )
+
+_ACTIVE_WORKERS: set[QThread] = set()
+
+
+def _release_worker(worker: QThread) -> None:
+    """Release tracked worker reference and schedule safe C++ cleanup after thread completion."""
+    _ACTIVE_WORKERS.discard(worker)
+    try:
+        worker.deleteLater()
+    except RuntimeError:
+        pass
+
+
+def track_worker(worker: QThread) -> None:
+    """Retain a strong Python reference to a worker until its QThread finishes."""
+    _ACTIVE_WORKERS.add(worker)
+    worker.finished.connect(lambda w=worker: _release_worker(w))
+
+
+def cancel_and_wait_active_workers(timeout_ms: int = 12000) -> None:
+    """Cancel and await any still-running tracked workers before application teardown."""
+    for worker in list(_ACTIVE_WORKERS):
+        cancel_fn = getattr(worker, "cancel", None)
+        if callable(cancel_fn):
+            try:
+                cancel_fn()
+            except RuntimeError:
+                pass
+        try:
+            if worker.isRunning():
+                worker.wait(timeout_ms)
+        except RuntimeError:
+            pass
+        try:
+            if not worker.isRunning():
+                _ACTIVE_WORKERS.discard(worker)
+        except RuntimeError:
+            _ACTIVE_WORKERS.discard(worker)
 
 
 class CheckUpdateWorker(QThread):
@@ -28,14 +67,28 @@ class CheckUpdateWorker(QThread):
         super().__init__(parent)
         self.current_version = current_version
         self._is_cancelled = False
+        self._active_response: Any = None
+
+    def _set_active_response(self, response: Any) -> None:
+        self._active_response = response
 
     def cancel(self) -> None:
         self._is_cancelled = True
+        resp = self._active_response
+        if resp is not None:
+            try:
+                resp.close()
+            except Exception:
+                pass
 
     def run(self) -> None:
         if self._is_cancelled:
             return
-        is_avail, info, msg = fetch_latest_release_info(self.current_version)
+        is_avail, info, msg = fetch_latest_release_info(
+            self.current_version,
+            cancel_check=lambda: self._is_cancelled,
+            on_response=self._set_active_response,
+        )
         if not self._is_cancelled:
             self.check_finished.emit(is_avail, info, msg)
 
@@ -55,13 +108,17 @@ class DownloadUpdateWorker(QThread):
 
     def cancel(self) -> None:
         self._is_cancelled = True
-        if self._active_response is not None:
+        resp = self._active_response
+        if resp is not None:
             try:
-                self._active_response.close()
+                resp.close()
             except Exception:
                 pass
 
     def run(self) -> None:
+        if self._is_cancelled:
+            return
+
         if not is_safe_update_url(self.update_info.download_url):
             self.download_failed.emit(f"Untrusted download URL rejected: {self.update_info.download_url}")
             return
@@ -78,18 +135,30 @@ class DownloadUpdateWorker(QThread):
                 headers={"User-Agent": "Tared-Updater"},
             )
 
-            with urllib.request.urlopen(req, timeout=15) as response:
+            with open_safe_update_url(req, timeout=8) as response:
                 self._active_response = response
-                resp_url = getattr(response, "geturl", lambda: None)()
-                if isinstance(resp_url, str) and not is_safe_update_url(resp_url):
-                    self.download_failed.emit(f"Redirect to untrusted update host rejected: {resp_url}")
+                if self._is_cancelled:
+                    staging_path.unlink(missing_ok=True)
                     return
 
-                declared_len = int(response.headers.get("Content-Length", self.update_info.asset_size or 0))
+                resp_url = getattr(response, "geturl", lambda: None)()
+                if isinstance(resp_url, str) and not is_safe_update_url(resp_url):
+                    if not self._is_cancelled:
+                        self.download_failed.emit(f"Redirect to untrusted update host rejected: {resp_url}")
+                    return
+
+                header_len = response.headers.get("Content-Length")
+                declared_len = (
+                    int(header_len)
+                    if header_len and header_len.strip().isdigit()
+                    else int(self.update_info.asset_size or 0)
+                )
                 if declared_len > MAX_UPDATE_SIZE_BYTES:
-                    self.download_failed.emit(
-                        f"Update payload size ({declared_len / (1024*1024):.1f} MB) exceeds maximum allowed limit."
-                    )
+                    if not self._is_cancelled:
+                        size_mb = declared_len / (1024 * 1024)
+                        self.download_failed.emit(
+                            f"Update payload size ({size_mb:.1f} MB) exceeds maximum allowed limit."
+                        )
                     return
 
                 total_bytes = declared_len
@@ -100,7 +169,6 @@ class DownloadUpdateWorker(QThread):
                     while True:
                         if self._is_cancelled:
                             staging_path.unlink(missing_ok=True)
-                            self.download_failed.emit("Download cancelled by user.")
                             return
 
                         chunk = response.read(chunk_size)
@@ -112,22 +180,34 @@ class DownloadUpdateWorker(QThread):
 
                         if bytes_read > MAX_UPDATE_SIZE_BYTES:
                             staging_path.unlink(missing_ok=True)
-                            self.download_failed.emit("Update stream exceeded maximum size limit.")
+                            if not self._is_cancelled:
+                                self.download_failed.emit("Update stream exceeded maximum size limit.")
                             return
 
                         pct = int((bytes_read / total_bytes) * 100) if total_bytes > 0 else 0
-                        self.progress.emit(min(pct, 100), bytes_read, total_bytes)
+                        if not self._is_cancelled:
+                            self.progress.emit(min(pct, 100), bytes_read, total_bytes)
+
+            if self._is_cancelled:
+                staging_path.unlink(missing_ok=True)
+                return
 
             if not self.update_info.expected_sha256:
                 staging_path.unlink(missing_ok=True)
-                self.download_failed.emit("Release lacks a verified SHA-256 digest. Automated update aborted.")
+                if not self._is_cancelled:
+                    self.download_failed.emit("Release lacks a verified SHA-256 digest. Automated update aborted.")
                 return
 
             if not verify_binary_payload(staging_path, expected_sha256=self.update_info.expected_sha256):
                 staging_path.unlink(missing_ok=True)
-                self.download_failed.emit(
-                    "Downloaded update failed security integrity check (hash mismatch or invalid binary)."
-                )
+                if not self._is_cancelled:
+                    self.download_failed.emit(
+                        "Downloaded update failed security integrity check (hash mismatch or invalid binary)."
+                    )
+                return
+
+            if self._is_cancelled:
+                staging_path.unlink(missing_ok=True)
                 return
 
             self.download_finished.emit(staging_path)

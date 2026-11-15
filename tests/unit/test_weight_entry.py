@@ -458,6 +458,515 @@ class TestWeightBasedFormulation(unittest.TestCase):
         self.assertIn("Proportional Scaling", dialog.summary_label.text())
         dialog.close()
 
+    def test_reopen_dialog_with_zero_rounded_trace_ingredient_allows_apply(self) -> None:
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        dialog = BatchByWeightDialog(
+            repository=repo,
+            service=None,
+            current_ingredients=[
+                {"name": "Micro Trace Active", "percentage": Decimal("0.001"), "cost_per_unit": Decimal("500.00")},
+                {"name": "Bulk Excipient", "percentage": Decimal("99.999"), "cost_per_unit": Decimal("1.00")},
+            ],
+            current_target_weight=Decimal("10.00"),
+            precision=Decimal("0.01"),
+        )
+        self.assertEqual(dialog.table.item(0, 1).text(), "0.00")
+        self.assertTrue(dialog.btn_apply.isEnabled())
+
+        dialog.table.item(0, 2).setText("550.00")
+        with patch.object(dialog, "accept") as mock_accept:
+            dialog._apply()
+            mock_accept.assert_called_once()
+
+        ingredients = dialog.get_ingredients()
+        self.assertEqual(ingredients[0]["percentage"], Decimal("0.001"))
+        self.assertEqual(ingredients[0]["cost_per_unit"], Decimal("550.00"))
+        dialog.close()
+
+    def test_dialog_spinbox_parses_en_us_and_de_de_grouped_target_weights(self) -> None:
+        from PyQt6.QtCore import QLocale
+
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        dialog = BatchByWeightDialog(
+            repository=repo,
+            service=None,
+            current_ingredients=[{"name": "Base", "weight": Decimal("500.00"), "cost_per_unit": Decimal("1.00")}],
+            current_target_weight=Decimal("1000.00"),
+            precision=Decimal("0.01"),
+        )
+        dialog.auto_target_cb.setChecked(False)
+
+        dialog.target_weight_spin.setLocale(QLocale(QLocale.Language.English, QLocale.Country.UnitedStates))
+        dialog.target_weight_spin.setValue(1250.50)
+        dialog._recalculate()
+        self.assertEqual(dialog._resolved_target_weight, Decimal("1250.50"))
+
+        dialog.target_weight_spin.setLocale(QLocale(QLocale.Language.German, QLocale.Country.Germany))
+        dialog.target_weight_spin.setValue(1250.50)
+        dialog._recalculate()
+        self.assertEqual(dialog._resolved_target_weight, Decimal("1250.50"))
+        dialog.close()
+
+    def test_reopen_dialog_preserves_intentional_zero_cost_when_catalog_has_price(self) -> None:
+        from tared.core.service import RecipeService
+
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        repo.save_catalog_ingredient(CatalogIngredient("Water", Decimal("0.50")))
+        service = RecipeService(repo)
+
+        dialog = BatchByWeightDialog(
+            repository=repo,
+            service=service,
+            current_ingredients=[
+                {"name": "Water", "percentage": Decimal("50.00"), "cost_per_unit": Decimal("0.00")},
+                {"name": "Sugar", "percentage": Decimal("50.00"), "cost_per_unit": Decimal("1.00")},
+            ],
+            current_target_weight=Decimal("1000.00"),
+            precision=Decimal("0.01"),
+        )
+        self.assertEqual(dialog.table.item(0, 2).text(), "0.00")
+        ingredients = dialog.get_ingredients()
+        self.assertEqual(ingredients[0]["cost_per_unit"], Decimal("0.00"))
+        dialog.close()
+
+    def test_invalid_and_negative_weight_surfaces_error_in_summary_and_disables_apply(self) -> None:
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        dialog = BatchByWeightDialog(
+            repository=repo,
+            service=None,
+            current_ingredients=[],
+            current_target_weight=Decimal("1000.00"),
+            precision=Decimal("0.01"),
+        )
+        self.addCleanup(dialog.close)
+        dialog.table.setRowCount(0)
+        dialog._add_row("Water", Decimal("100.00"))
+        self.assertTrue(dialog.btn_apply.isEnabled())
+
+        dialog.table.item(0, 1).setText("abc")
+        self.assertFalse(dialog.btn_apply.isEnabled())
+        self.assertIn("invalid weight", dialog.summary_label.text())
+
+        dialog.table.item(0, 1).setText("-10")
+        self.assertFalse(dialog.btn_apply.isEnabled())
+        self.assertIn("cannot be negative", dialog.summary_label.text())
+
+        dialog.table.item(0, 1).setText("100.00")
+        self.assertTrue(dialog.btn_apply.isEnabled())
+
+    def test_toggling_auto_target_preserves_trace_ingredient_and_exact_percentages(self) -> None:
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        dialog = BatchByWeightDialog(
+            repository=repo,
+            service=None,
+            current_ingredients=[
+                {"name": "Micro Trace Active", "percentage": Decimal("0.001"), "cost_per_unit": Decimal("500.00")},
+                {"name": "Bulk Excipient", "percentage": Decimal("99.999"), "cost_per_unit": Decimal("1.00")},
+            ],
+            current_target_weight=Decimal("10.00"),
+            precision=Decimal("0.01"),
+        )
+        self.addCleanup(dialog.close)
+        self.assertTrue(dialog.btn_apply.isEnabled())
+
+        dialog.auto_target_cb.setChecked(False)
+        dialog.target_weight_spin.setValue(50.00)
+        self.assertFalse(dialog._weights_modified)
+        self.assertTrue(dialog.has_user_edits())
+        self.assertTrue(dialog.btn_apply.isEnabled())
+        self.assertEqual(dialog.get_target_weight(), Decimal("50.00"))
+        self.assertEqual(dialog.get_ingredients()[0]["percentage"], Decimal("0.001"))
+
+    def test_reopen_incomplete_draft_keeps_initial_target_weight_unchecked(self) -> None:
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        dialog = BatchByWeightDialog(
+            repository=repo,
+            service=None,
+            current_ingredients=[
+                {"name": "Water", "percentage": Decimal("25.00"), "cost_per_unit": Decimal("0.10")},
+                {"name": "Sugar", "percentage": Decimal("25.00"), "cost_per_unit": Decimal("1.00")},
+            ],
+            current_target_weight=Decimal("1000.00"),
+            precision=Decimal("0.01"),
+        )
+        self.addCleanup(dialog.close)
+        self.assertFalse(dialog.auto_target_cb.isChecked())
+        self.assertEqual(dialog.get_target_weight(), Decimal("1000.00"))
+        self.assertIn("Target Mass: 1000.00 g", dialog.summary_label.text())
+        self.assertIn("Formula Total: 50.00%", dialog.summary_label.text())
+
+    def test_dialog_frames_avoid_hardcoded_light_backgrounds_without_text_color(self) -> None:
+        from PyQt6.QtWidgets import QFrame
+
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        dialog = BatchByWeightDialog(
+            repository=repo,
+            service=None,
+            current_ingredients=[],
+            current_target_weight=Decimal("1000.00"),
+            precision=Decimal("0.01"),
+        )
+        self.addCleanup(dialog.close)
+        for frame in dialog.findChildren(QFrame):
+            style = frame.styleSheet().lower()
+            if "background-color" in style:
+                self.assertIn("color:", style)
+
+    def test_parse_decimal_input_space_grouping_localized_sci_and_bare_dot(self) -> None:
+        from PyQt6.QtCore import QLocale
+
+        fr_locale = QLocale(QLocale.Language.French, QLocale.Country.France)
+        self.assertEqual(_parse_decimal_input("1 250,50", locale=fr_locale), Decimal("1250.50"))
+
+        de_locale = QLocale(QLocale.Language.German, QLocale.Country.Germany)
+        self.assertEqual(_parse_decimal_input("1,5e-4", locale=de_locale), Decimal("0.00015"))
+
+        us_locale = QLocale(QLocale.Language.English, QLocale.Country.UnitedStates)
+        with self.assertRaises(ValueError):
+            _parse_decimal_input("1,5e-4", locale=us_locale)
+        for bad in (".", "+.", "-."):
+            with self.assertRaises(ValueError):
+                _parse_decimal_input(bad, locale=us_locale)
+
+    def test_checking_auto_target_on_incomplete_draft_normalizes_percentages(self) -> None:
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        dialog = BatchByWeightDialog(
+            repository=repo,
+            service=None,
+            current_ingredients=[
+                {"name": "Water", "percentage": Decimal("25.00"), "cost_per_unit": Decimal("0.10")},
+                {"name": "Sugar", "percentage": Decimal("25.00"), "cost_per_unit": Decimal("1.00")},
+            ],
+            current_target_weight=Decimal("1000.00"),
+            precision=Decimal("0.01"),
+        )
+        self.addCleanup(dialog.close)
+        self.assertFalse(dialog.auto_target_cb.isChecked())
+
+        dialog.auto_target_cb.setChecked(True)
+        self.assertEqual(dialog.get_target_weight(), Decimal("500.00"))
+        self.assertIn("Formula Total: 100.00%", dialog.summary_label.text())
+        applied = dialog.get_ingredients()
+        self.assertNotIn("percentage", applied[0])
+        self.assertEqual(applied[0]["weight"], Decimal("250.00"))
+
+    def test_reverting_weight_typo_restores_trace_preservation_and_invalid_cost_shows_error(self) -> None:
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        dialog = BatchByWeightDialog(
+            repository=repo,
+            service=None,
+            current_ingredients=[
+                {"name": "Micro Trace Active", "percentage": Decimal("0.001"), "cost_per_unit": Decimal("500.00")},
+                {"name": "Bulk Excipient", "percentage": Decimal("99.999"), "cost_per_unit": Decimal("1.00")},
+            ],
+            current_target_weight=Decimal("10.00"),
+            precision=Decimal("0.01"),
+        )
+        self.addCleanup(dialog.close)
+        self.assertTrue(dialog.btn_apply.isEnabled())
+
+        dialog.table.item(1, 1).setText("20.00")
+        self.assertTrue(dialog._weights_modified)
+        self.assertFalse(dialog.btn_apply.isEnabled())
+        self.assertIn("weight must be greater than 0", dialog.summary_label.text())
+
+        dialog.table.item(1, 1).setText("10.00")
+        self.assertFalse(dialog._weights_modified)
+        self.assertTrue(dialog.btn_apply.isEnabled())
+
+        dialog.table.item(0, 2).setText("-5.00")
+        self.assertFalse(dialog.btn_apply.isEnabled())
+        self.assertIn("cannot be negative", dialog.summary_label.text())
+
+    def test_dialog_comma_decimal_locale_preserves_precision_and_autofill(self) -> None:
+        from PyQt6.QtCore import QLocale
+
+        from tared.core.service import RecipeService
+
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        repo.save_catalog_ingredient(CatalogIngredient("Citric Acid", Decimal("12.75")))
+        service = RecipeService(repo)
+
+        de_locale = QLocale(QLocale.Language.German, QLocale.Country.Germany)
+        with patch("tared.ui.models.recipe_table_model.QLocale", return_value=de_locale):
+            dialog = BatchByWeightDialog(
+                repository=repo,
+                service=service,
+                current_ingredients=[
+                    {"name": "Trace Active", "percentage": Decimal("0.001"), "cost_per_unit": Decimal("500.00")},
+                    {"name": "Main Base", "percentage": Decimal("99.999"), "cost_per_unit": Decimal("2.50")},
+                ],
+                current_target_weight=Decimal("1.500"),
+                precision=Decimal("0.001"),
+            )
+            self.addCleanup(dialog.close)
+
+            self.assertEqual(dialog.table.item(0, 1).text(), "0,000")
+            self.assertEqual(dialog.table.item(1, 1).text(), "1,500")
+            self.assertEqual(dialog.table.item(1, 2).text(), "2,50")
+            self.assertTrue(dialog.btn_apply.isEnabled())
+
+            ingredients = dialog.get_ingredients()
+            self.assertEqual(ingredients[1]["weight"], Decimal("1.500"))
+            self.assertEqual(ingredients[1]["cost_per_unit"], Decimal("2.50"))
+
+            dialog._add_row(name="", weight=Decimal("0.500"), cost=Decimal("0.00"))
+            self.assertEqual(dialog.table.item(2, 2).text(), "0,00")
+            dialog.table.item(2, 0).setText("Citric Acid")
+            self.assertEqual(dialog.table.item(2, 2).text(), "12,75")
+
+    def test_reopen_incomplete_draft_quantizes_non_multiple_fallback_weight_and_preserves_pct(self) -> None:
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        dialog = BatchByWeightDialog(
+            repository=repo,
+            service=None,
+            current_ingredients=[
+                {"name": "Water", "percentage": Decimal("33.33"), "cost_per_unit": Decimal("0.10")},
+                {"name": "Sugar", "percentage": Decimal("33.33"), "cost_per_unit": Decimal("1.00")},
+            ],
+            current_target_weight=Decimal("10.00"),
+            precision=Decimal("0.01"),
+        )
+        self.addCleanup(dialog.close)
+
+        self.assertEqual(dialog.table.item(0, 1).text(), "3.33")
+        self.assertEqual(dialog.table.item(1, 1).text(), "3.33")
+        self.assertTrue(dialog.btn_apply.isEnabled())
+
+        dialog.table.item(0, 2).setText("0.20")
+        self.assertFalse(dialog._weights_modified)
+        self.assertEqual(dialog.get_ingredients()[0]["percentage"], Decimal("33.33"))
+
+        dialog.auto_target_cb.setChecked(True)
+        self.assertEqual(dialog.get_target_weight(), Decimal("6.66"))
+        self.assertTrue(dialog.btn_apply.isEnabled())
+
+    def test_dialog_rejects_target_weight_above_max_limit(self) -> None:
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        dialog = BatchByWeightDialog(
+            repository=repo,
+            service=None,
+            current_ingredients=[],
+            current_target_weight=Decimal("1000.00"),
+            precision=Decimal("0.01"),
+        )
+        self.addCleanup(dialog.close)
+        dialog.table.setRowCount(0)
+        dialog._add_row("Water", Decimal("1000000001.00"))
+
+        self.assertFalse(dialog.btn_apply.isEnabled())
+        self.assertIn("exceeds maximum limit", dialog.summary_label.text())
+
+    def test_reopen_incomplete_draft_with_unquantized_model_weights_succeeds(self) -> None:
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        draft = Recipe(
+            id="incomplete-unquantized-weight",
+            name="Incomplete Draft",
+            is_draft=True,
+            ingredients=(
+                Ingredient("Water", Decimal("33.33"), Decimal("0.10")),
+                Ingredient("Sugar", Decimal("33.33"), Decimal("1.00")),
+            ),
+        )
+        self.model.set_precision(Decimal("0.01"))
+        self.model.set_target_weight(Decimal("10.00"))
+        self.model.load_recipe(draft)
+
+        dialog = BatchByWeightDialog(
+            repository=repo,
+            service=None,
+            current_ingredients=self.model.ingredients_data,
+            current_target_weight=self.model.target_weight,
+            precision=self.model.precision,
+        )
+        self.addCleanup(dialog.close)
+
+        self.assertEqual(dialog.table.item(0, 1).text(), "3.33")
+        self.assertEqual(dialog.table.item(1, 1).text(), "3.33")
+        self.assertNotIn("not a multiple", dialog.summary_label.text())
+        self.assertTrue(dialog.btn_apply.isEnabled())
+        self.assertEqual(dialog.get_ingredients()[0]["percentage"], Decimal("33.33"))
+
+    def test_dialog_allows_cleared_empty_unit_cost_as_zero_on_apply(self) -> None:
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        dialog = BatchByWeightDialog(
+            repository=repo,
+            service=None,
+            current_ingredients=[],
+            current_target_weight=Decimal("1000.00"),
+            precision=Decimal("0.01"),
+        )
+        self.addCleanup(dialog.close)
+        dialog.table.setRowCount(0)
+        dialog._add_row("Water", Decimal("100.00"), Decimal("5.00"))
+
+        dialog.table.item(0, 2).setText("   ")
+        self.assertTrue(dialog.btn_apply.isEnabled())
+
+        with patch("PyQt6.QtWidgets.QMessageBox.warning") as mock_warn:
+            with patch.object(dialog, "accept") as mock_accept:
+                dialog._apply()
+                mock_warn.assert_not_called()
+                mock_accept.assert_called_once()
+
+        ingredients = dialog.get_ingredients()
+        self.assertEqual(ingredients[0]["cost_per_unit"], Decimal("0.00"))
+
+    def test_main_window_batch_by_weight_status_bar_respects_precision_decimals(self) -> None:
+        from unittest.mock import MagicMock
+
+        from PyQt6.QtWidgets import QDialog
+
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        window = MainWindow(repo)
+        self.addCleanup(window.close)
+        window.precision_combo.setCurrentIndex(0)  # 0.001 g
+
+        mock_dlg = MagicMock()
+        mock_dlg.exec.return_value = QDialog.DialogCode.Accepted
+        mock_dlg.has_user_edits.return_value = True
+        mock_dlg.get_ingredients.return_value = [
+            {"name": "Active", "weight": Decimal("0.125"), "cost_per_unit": Decimal("10.00")},
+            {"name": "Water", "weight": Decimal("100.000"), "cost_per_unit": Decimal("0.10")},
+        ]
+        mock_dlg.get_target_weight.return_value = Decimal("100.125")
+
+        with patch("tared.ui.views.weight_entry_dialog.BatchByWeightDialog", return_value=mock_dlg):
+            window._open_batch_by_weight_dialog()
+
+        self.assertIn("100.125 g total.", window.statusBar().currentMessage())
+
+    def test_unchecking_auto_target_on_incomplete_draft_restores_original_percentages(self) -> None:
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        dialog = BatchByWeightDialog(
+            repository=repo,
+            service=None,
+            current_ingredients=[
+                {"name": "Water", "percentage": Decimal("25.00"), "cost_per_unit": Decimal("0.10")},
+                {"name": "Sugar", "percentage": Decimal("25.00"), "cost_per_unit": Decimal("1.00")},
+            ],
+            current_target_weight=Decimal("1000.00"),
+            precision=Decimal("0.01"),
+        )
+        self.addCleanup(dialog.close)
+        self.assertFalse(dialog.auto_target_cb.isChecked())
+
+        dialog.auto_target_cb.setChecked(True)
+        self.assertIn("Formula Total: 100.00%", dialog.summary_label.text())
+        self.assertEqual(dialog.get_target_weight(), Decimal("500.00"))
+
+        dialog.auto_target_cb.setChecked(False)
+        self.assertIn("Formula Total: 50.00%", dialog.summary_label.text())
+        self.assertEqual(dialog.get_target_weight(), Decimal("1000.00"))
+        applied = dialog.get_ingredients()
+        self.assertEqual(applied[0]["percentage"], Decimal("25.00"))
+        self.assertEqual(applied[1]["percentage"], Decimal("25.00"))
+
+    def test_incomplete_draft_target_mass_change_updates_model_weights(self) -> None:
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        dialog = BatchByWeightDialog(
+            repository=repo,
+            service=None,
+            current_ingredients=[
+                {"name": "Water", "percentage": Decimal("25.00"), "cost_per_unit": Decimal("0.10")},
+                {"name": "Sugar", "percentage": Decimal("25.00"), "cost_per_unit": Decimal("1.00")},
+            ],
+            current_target_weight=Decimal("1000.00"),
+            precision=Decimal("0.01"),
+        )
+        self.addCleanup(dialog.close)
+        self.assertFalse(dialog.auto_target_cb.isChecked())
+
+        dialog.target_weight_spin.setValue(2000.00)
+        self.assertTrue(dialog.has_user_edits())
+        self.assertFalse(dialog._weights_modified)
+        self.assertEqual(dialog.table.item(0, 1).text(), "500.00")
+        self.assertEqual(dialog.table.item(1, 1).text(), "500.00")
+        self.assertEqual(dialog.get_target_weight(), Decimal("2000.00"))
+
+        self.model.set_ingredients_from_weights(dialog.get_ingredients(), target_weight=dialog.get_target_weight())
+        self.assertIsNone(self.model.current_batch)
+        self.assertEqual(self.model.ingredients_data[0]["weight"], Decimal("500.00"))
+        self.assertEqual(self.model.ingredients_data[1]["weight"], Decimal("500.00"))
+        self.assertEqual(self.model.data(self.model.index(0, 3)), "500.00")
+
+    def test_dialog_spinbox_falls_back_cleanly_under_en_in_locale(self) -> None:
+        from PyQt6.QtCore import QLocale
+
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        dialog = BatchByWeightDialog(
+            repository=repo,
+            service=None,
+            current_ingredients=[{"name": "Base", "weight": Decimal("500.00"), "cost_per_unit": Decimal("1.00")}],
+            current_target_weight=Decimal("1000.00"),
+            precision=Decimal("0.01"),
+        )
+        self.addCleanup(dialog.close)
+        dialog.auto_target_cb.setChecked(False)
+
+        in_locale = QLocale(QLocale.Language.English, QLocale.Country.India)
+        dialog.target_weight_spin.setLocale(in_locale)
+        dialog.target_weight_spin.setValue(100000.05)
+        dialog._recalculate()
+
+        self.assertEqual(dialog._resolved_target_weight, Decimal("100000.05"))
+        self.assertTrue(dialog.btn_apply.isEnabled())
+        with patch.object(dialog, "accept") as mock_accept:
+            dialog._apply()
+            mock_accept.assert_called_once()
+
+    def test_cleared_weight_on_preserved_trace_applies_while_huge_unit_cost_is_rejected(self) -> None:
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        dialog = BatchByWeightDialog(
+            repository=repo,
+            service=None,
+            current_ingredients=[
+                {"name": "Micro Trace Active", "percentage": Decimal("0.001"), "cost_per_unit": Decimal("500.00")},
+                {"name": "Bulk Excipient", "percentage": Decimal("99.999"), "cost_per_unit": Decimal("1.00")},
+            ],
+            current_target_weight=Decimal("10.00"),
+            precision=Decimal("0.01"),
+        )
+        self.addCleanup(dialog.close)
+
+        # Clearing trace row weight remains consistent between _recalculate() and _apply()
+        dialog.table.item(0, 1).setText("")
+        self.assertTrue(dialog.btn_apply.isEnabled())
+        with patch("PyQt6.QtWidgets.QMessageBox.warning") as mock_warn:
+            with patch.object(dialog, "accept") as mock_accept:
+                dialog._apply()
+                mock_warn.assert_not_called()
+                mock_accept.assert_called_once()
+
+        # Huge scientific notation unit cost must be rejected cleanly
+        dialog.table.item(0, 2).setText("1e10000000")
+        self.assertFalse(dialog.btn_apply.isEnabled())
+        self.assertIn("exceeds maximum limit", dialog.summary_label.text())
+        with patch("PyQt6.QtWidgets.QMessageBox.warning") as mock_warn:
+            with patch.object(dialog, "accept") as mock_accept:
+                dialog._apply()
+                mock_warn.assert_called_once()
+                mock_accept.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

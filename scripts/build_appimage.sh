@@ -63,9 +63,26 @@ mkdir -p "${APP_DIR}/assets"
 cp -r dist/tared/* "${APP_DIR}/usr/bin/"
 
 # Copy both libxkbcommon and libxkbcommon-x11 into usr/lib to guarantee zero split-pair mismatch
-for xkb_lib in /usr/lib/x86_64-linux-gnu/libxkbcommon*.so*; do
-    if [ -f "${xkb_lib}" ]; then
-        cp -d "${xkb_lib}" "${APP_DIR}/usr/lib/" 2>/dev/null || true
+XKB_SEARCH_DIRS=("/usr/lib/${ARCH}-linux-gnu")
+if command -v gcc >/dev/null 2>&1; then
+    MULTIARCH_TRIPLET="$(gcc -print-multiarch 2>/dev/null || true)"
+    if [ -n "${MULTIARCH_TRIPLET}" ] && [ "${MULTIARCH_TRIPLET}" != "${ARCH}-linux-gnu" ]; then
+        XKB_SEARCH_DIRS+=("/usr/lib/${MULTIARCH_TRIPLET}")
+    fi
+fi
+XKB_SEARCH_DIRS+=("/usr/lib64" "/usr/lib")
+
+for lib_dir in "${XKB_SEARCH_DIRS[@]}"; do
+    [ -d "${lib_dir}" ] || continue
+    found_xkb=false
+    for xkb_lib in "${lib_dir}"/libxkbcommon*.so*; do
+        if [ -f "${xkb_lib}" ]; then
+            cp -d "${xkb_lib}" "${APP_DIR}/usr/lib/" 2>/dev/null || true
+            found_xkb=true
+        fi
+    done
+    if [ "${found_xkb}" = "true" ]; then
+        break
     fi
 done
 
@@ -86,8 +103,9 @@ cat << 'RUNNER' > "${APP_DIR}/AppRun"
 #!/bin/sh
 SELF=$(readlink -f "$0")
 HERE=${SELF%/*}
+export TARED_ORIG_LD_LIBRARY_PATH="${TARED_ORIG_LD_LIBRARY_PATH:-${LD_LIBRARY_PATH:-}}"
 export PATH="${HERE}/usr/bin:${PATH}"
-export LD_LIBRARY_PATH="${HERE}/usr/lib:${HERE}/usr/bin/_internal:${HERE}/usr/bin:${LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="${HERE}/usr/lib:${HERE}/usr/bin/_internal:${HERE}/usr/bin${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
 export QT_IM_MODULE="${QT_IM_MODULE:-compose}"
 export XMODIFIERS="${XMODIFIERS:-@im=none}"

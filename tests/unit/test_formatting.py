@@ -36,9 +36,12 @@ class TestFormatting(unittest.TestCase):
 
     def test_format_currency_fractional_cents_and_micro_costs(self) -> None:
         self.assertEqual(format_currency(Decimal("0.125")), "$0.1250")
+        self.assertEqual(format_currency(Decimal("0.1250000")), "$0.1250")
         self.assertEqual(format_currency(Decimal("0.002")), "$0.0020")
+        self.assertEqual(format_currency(Decimal("0.0020000")), "$0.0020")
         self.assertEqual(format_currency(Decimal("0.0001")), "$0.0001")
         self.assertEqual(format_currency(Decimal("0.000001")), "$0.000001")
+        self.assertEqual(format_currency(Decimal("0.00000100")), "$0.000001")
 
     def test_format_currency_sub_nano_and_negative_amounts(self) -> None:
         self.assertEqual(format_currency(Decimal("1e-9")), "$0.000000001")
@@ -66,6 +69,31 @@ class TestFormatting(unittest.TestCase):
 
         fractional_cent_costs = [Decimal("1.50"), Decimal("0.125"), Decimal("0.25")]
         self.assertEqual(determine_cost_precision(fractional_cent_costs), 4)
+
+    def test_format_currency_zero_with_zero_precision_and_non_finite_guard(self) -> None:
+        self.assertEqual(format_currency(Decimal("0"), precision=0), "$0")
+        self.assertEqual(format_currency(Decimal("5.4"), precision=0), "$5")
+        with self.assertRaises(ValueError):
+            format_currency(Decimal("NaN"))
+
+    def test_format_currency_rejects_negative_precision(self) -> None:
+        with self.assertRaises(ValueError):
+            format_currency(Decimal("5.40"), precision=-1)
+        with self.assertRaises(ValueError):
+            format_currency(Decimal("0"), precision=-1)
+
+    def test_format_percentage_ultra_trace_and_non_finite_guard(self) -> None:
+        self.assertEqual(format_percentage(Decimal("1e-7")), "0.0000001")
+        self.assertEqual(format_percentage(Decimal("0")), "0.00")
+        with self.assertRaises(ValueError):
+            format_percentage(Decimal("Infinity"))
+
+    def test_format_rejects_huge_scientific_exponents_without_hanging(self) -> None:
+        self.assertEqual(format_currency(Decimal("1e15")), "$1000000000000000.00")
+        with self.assertRaises(ValueError):
+            format_currency(Decimal("1e10000000"))
+        with self.assertRaises(ValueError):
+            format_percentage(Decimal("1e10000000"))
 
 
 if __name__ == "__main__":

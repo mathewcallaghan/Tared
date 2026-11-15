@@ -85,6 +85,31 @@ class TestConfigManager(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.config.default_precision = "0.05"
 
+    def test_should_attempt_backup_and_resolve_backup_target(self) -> None:
+        self.assertFalse(self.config.should_attempt_backup())
+        with self.assertRaises(ValueError):
+            self.config.resolve_backup_target()
+
+        self.config.auto_backup_enabled = True
+        self.assertFalse(self.config.should_attempt_backup())
+
+        missing_dir = Path(self.temp_dir.name) / "missing_backup_dir"
+        self.config.auto_backup_dir = str(missing_dir)
+        self.assertTrue(self.config.should_attempt_backup())
+        with self.assertRaises(FileNotFoundError):
+            self.config.resolve_backup_target()
+
+        regular_file = Path(self.temp_dir.name) / "not_a_dir.txt"
+        regular_file.write_text("x", encoding="utf-8")
+        self.config.auto_backup_dir = str(regular_file)
+        with self.assertRaises(NotADirectoryError):
+            self.config.resolve_backup_target()
+
+        valid_dir = Path(self.temp_dir.name) / "valid_backup_dir"
+        valid_dir.mkdir()
+        self.config.auto_backup_dir = str(valid_dir)
+        self.assertEqual(self.config.resolve_backup_target(), valid_dir.resolve() / "tared_workspace.json")
+
 
 if __name__ == "__main__":
     unittest.main()

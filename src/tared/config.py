@@ -127,12 +127,26 @@ class ConfigManager:
         self.last_backup_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         self.last_backup_status = "SUCCESS" if success else f"FAILED: {message}"
 
+    def should_attempt_backup(self) -> bool:
+        """Return True when automated backup is enabled and a target folder is specified."""
+        return bool(self.auto_backup_enabled and self.auto_backup_dir)
+
+    def resolve_backup_target(self) -> Path:
+        """Validate configured backup folder and return target workspace backup file path."""
+        if not self.should_attempt_backup():
+            raise ValueError("Automated backup is disabled or backup folder is empty.")
+        backup_dir = Path(self.auto_backup_dir).expanduser().resolve()
+        if not backup_dir.exists():
+            raise FileNotFoundError(f"Backup folder does not exist: {backup_dir}")
+        if not backup_dir.is_dir():
+            raise NotADirectoryError(f"Backup path is not a directory: {backup_dir}")
+        if not os.access(backup_dir, os.W_OK):
+            raise PermissionError(f"Backup folder is not writable: {backup_dir}")
+        return backup_dir / "tared_workspace.json"
+
     def is_backup_configured(self) -> bool:
         """Check if automated backup is enabled and target folder exists and is writable."""
-        if not self.auto_backup_enabled:
+        if not self.should_attempt_backup():
             return False
-        raw_dir = self.auto_backup_dir
-        if not raw_dir:
-            return False
-        p = Path(raw_dir).expanduser().resolve()
+        p = Path(self.auto_backup_dir).expanduser().resolve()
         return p.is_dir() and os.access(p, os.W_OK)

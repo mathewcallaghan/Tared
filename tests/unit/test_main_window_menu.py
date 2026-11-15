@@ -167,6 +167,246 @@ class TestMainWindowMenuAndBackup(unittest.TestCase):
         self.assertEqual(content["schema_version"], "1.0")
         self.assertEqual(len(content["recipes"]), 1)
 
+    def test_configured_default_precision_applied_on_startup(self) -> None:
+        custom_ini = Path(self.temp_dir.name) / "custom_prec.ini"
+        custom_cfg = ConfigManager(QSettings(str(custom_ini), QSettings.Format.IniFormat))
+        custom_cfg.default_precision = "0.001"
+
+        win = MainWindow(self.repo, config=custom_cfg)
+        self.addCleanup(win.close)
+
+        self.assertEqual(win.precision_combo.currentData(), "0.001")
+        self.assertEqual(win.table_model.precision, Decimal("0.001"))
+        self.assertEqual(win.target_weight_spin.decimals(), 3)
+        self.assertFalse(win._is_dirty)
+
+    def test_duplicate_active_dirty_recipe_prompts_and_handles_cancel_and_save(self) -> None:
+        self.window.name_input.setText("Unsaved Edited Title")
+        self.assertTrue(self.window._is_dirty)
+
+        # 1. Cancel aborts duplication and preserves unsaved edits
+        self.mock_question.return_value = QMessageBox.StandardButton.Cancel
+        self.window._duplicate_selected_recipe(self.recipe)
+        self.assertEqual(len(self.repo.list_recipes()), 1)
+        self.assertEqual(self.window.name_input.text(), "Unsaved Edited Title")
+        self.assertTrue(self.window._is_dirty)
+
+        # 2. Save commits active edits first and duplicates the updated formulation
+        self.mock_question.return_value = QMessageBox.StandardButton.Save
+        self.window._duplicate_selected_recipe(self.recipe)
+        recipes = self.repo.list_recipes()
+        self.assertEqual(len(recipes), 2)
+        orig = self.repo.get_recipe(self.recipe.id)
+        assert orig is not None
+        self.assertEqual(orig.name, "Unsaved Edited Title")
+        dupes = [r for r in recipes if r.id != self.recipe.id]
+        self.assertEqual(dupes[0].name, "Unsaved Edited Title (Copy)")
+        self.assertFalse(self.window._is_dirty)
+
+    def test_dirty_save_on_close_triggers_auto_backup_once(self) -> None:
+        backup_dir = Path(self.temp_dir.name) / "cloud_sync_once"
+        backup_dir.mkdir()
+        self.config.auto_backup_enabled = True
+        self.config.auto_backup_dir = str(backup_dir)
+
+        self.window.name_input.setText("Saved On Close Once")
+        self.assertTrue(self.window._is_dirty)
+        self.mock_question.return_value = QMessageBox.StandardButton.Save
+
+        with patch(
+            "tared.ui.views.main_window.export_workspace_to_json_file",
+            side_effect=lambda *args, **kwargs: Path(args[1]),
+        ) as mock_export:
+            event = QCloseEvent()
+            self.window.closeEvent(event)
+            self.assertTrue(event.isAccepted())
+            mock_export.assert_called_once()
+
+    def test_auto_backup_missing_dir_records_failure_and_prompts_on_close(self) -> None:
+        missing_dir = Path(self.temp_dir.name) / "unmounted_sync_drive"
+        self.config.auto_backup_enabled = True
+        self.config.auto_backup_dir = str(missing_dir)
+
+        with self.assertLogs("tared.ui.views.main_window", level="WARNING") as cm:
+            self.mock_warn.return_value = QMessageBox.StandardButton.No
+            cancel_evt = QCloseEvent()
+            self.window.closeEvent(cancel_evt)
+            self.assertFalse(cancel_evt.isAccepted())
+            self.mock_warn.assert_called_once()
+            self.assertIn("FAILED:", self.config.last_backup_status)
+
+            self.mock_warn.return_value = QMessageBox.StandardButton.Yes
+            accept_evt = QCloseEvent()
+            self.window.closeEvent(accept_evt)
+            self.assertTrue(accept_evt.isAccepted())
+
+        self.assertEqual(len(cm.output), 2)
+        self.assertTrue(all("unmounted_sync_drive" in msg for msg in cm.output))
+
+    def test_recipe_context_menu_escapes_ampersands_in_action_text(self) -> None:
+        from PyQt6.QtCore import QPoint, Qt
+
+        from tared.core.models import Ingredient, Recipe
+
+        amp_rec = Recipe(
+            id="rec-amp-test",
+            name="Oil & Vinegar Dressing",
+            version=1,
+            ingredients=(Ingredient("Oil", Decimal("100.00")),),
+        )
+        self.repo.save_recipe(amp_rec)
+        self.window._load_recipe_archive(select_id="rec-amp-test")
+
+        for i in range(self.window.recipe_list.count()):
+            item = self.window.recipe_list.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == "rec-amp-test":
+                rect = self.window.recipe_list.visualItemRect(item)
+                with patch("PyQt6.QtWidgets.QMenu.exec") as mock_menu_exec:
+                    self.window._on_recipe_list_context_menu(rect.center() if rect.isValid() else QPoint(5, 5))
+                    mock_menu_exec.assert_called_once()
+                break
+
+    def test_startup_update_timer_stopped_on_close_and_skips_when_closing(self) -> None:
+        from PyQt6.QtCore import QTimer
+
+        timer = QTimer(self.window)
+        timer.setSingleShot(True)
+        timer.start(5000)
+        self.window._startup_update_timer = timer
+        self.assertTrue(timer.isActive())
+
+        evt = QCloseEvent()
+        self.window.closeEvent(evt)
+        self.assertTrue(evt.isAccepted())
+        self.assertFalse(timer.isActive())
+        self.assertIsNone(self.window._startup_update_timer)
+
+        with patch("tared.ui.models.update_worker.CheckUpdateWorker") as mock_worker:
+            self.window._check_updates_silently()
+            mock_worker.assert_not_called()
+
+    def test_save_as_draft_with_zero_percentage_displays_readable_action_label(self) -> None:
+        self.window._create_new_recipe()
+        self.window.name_input.setText("Catalog Draft")
+        self.window.table_model.add_ingredient(
+            name="Sugar",
+            percentage=Decimal("0.00"),
+            cost_per_unit=Decimal("1.25"),
+        )
+        self.mock_warn.reset_mock()
+
+        result = self.window._save_current_recipe(as_draft=True)
+
+        self.assertFalse(result)
+        self.mock_warn.assert_called_once()
+        warn_msg = self.mock_warn.call_args[0][2]
+        self.assertIn("save a draft", warn_msg)
+        self.assertNotIn("save_draft", warn_msg)
+
+    def test_duplicate_incomplete_non_draft_formula_downgrades_to_draft_without_crashing(self) -> None:
+        from tared.core.models import Ingredient, Recipe
+
+        incomplete = Recipe(
+            id="rec-legacy-incomplete",
+            name="Legacy Incomplete",
+            version=1,
+            is_draft=False,
+            ingredients=(Ingredient("Water", Decimal("60.00"), Decimal("0.10")),),
+        )
+        self.repo.save_recipe(incomplete)
+
+        self.window._duplicate_selected_recipe(incomplete)
+
+        copies = [r for r in self.repo.list_recipes() if r.name == "Legacy Incomplete (Copy)"]
+        self.assertEqual(len(copies), 1)
+        self.assertTrue(copies[0].is_draft)
+        self.assertEqual(copies[0].version, 1)
+
+    def test_uncommitted_inline_editor_flushed_before_catalog_and_delete_actions(self) -> None:
+        from PyQt6.QtWidgets import QLineEdit
+
+        from tared.core.models import Ingredient, Recipe
+
+        repo = SQLiteRecipeRepository(":memory:")
+        self.addCleanup(repo.close)
+        repo.save_recipe(
+            Recipe(
+                id="r-flush",
+                name="Flush Formula",
+                ingredients=(Ingredient("Sugar", Decimal("100.00"), Decimal("1.00")),),
+            )
+        )
+
+        window = MainWindow(repo)
+        self.addCleanup(window.close)
+
+        idx = window.table_model.index(0, 2)
+        window.table_view.setCurrentIndex(idx)
+        window.table_view.edit(idx)
+        editor = window.table_view.viewport().findChild(QLineEdit)
+        self.assertIsNotNone(editor)
+        assert editor is not None
+        editor.setText("8.75")
+
+        window._add_selected_to_catalog()
+        cat_item = repo.get_catalog_ingredient("Sugar")
+        self.assertIsNotNone(cat_item)
+        assert cat_item is not None
+        self.assertEqual(cat_item.cost_per_unit, Decimal("8.75"))
+
+    def test_commit_active_table_editor_and_json_export_suffix(self) -> None:
+        from PyQt6.QtWidgets import QAbstractItemView, QLineEdit
+
+        # Idle commit is a safe no-op
+        self.window._commit_active_table_editor()
+        self.assertFalse(self.window._is_dirty)
+
+        idx = self.window.table_model.index(0, 2)
+        self.window.table_view.setCurrentIndex(idx)
+        self.window.table_view.edit(idx)
+        self.assertEqual(self.window.table_view.state(), QAbstractItemView.State.EditingState)
+        editor = self.window.table_view.viewport().findChild(QLineEdit)
+        self.assertIsNotNone(editor)
+        assert editor is not None
+        editor.setText("19.75")
+
+        self.window._commit_active_table_editor()
+        self.assertEqual(self.window.table_view.state(), QAbstractItemView.State.NoState)
+        self.assertEqual(self.window.table_model.ingredients_data[0]["cost_per_unit"], Decimal("19.75"))
+        self.assertTrue(self.window._is_dirty)
+
+        out_base = Path(self.temp_dir.name) / "formula_v1.2"
+        with patch(
+            "PyQt6.QtWidgets.QFileDialog.getSaveFileName",
+            return_value=(str(out_base), "JSON Files (*.json)"),
+        ):
+            self.window._export_recipe()
+        self.assertTrue(Path(f"{out_base}.json").is_file())
+
+    def test_uncommitted_inline_editor_flushed_before_new_and_data_transfer_prompts(self) -> None:
+        from PyQt6.QtWidgets import QLineEdit
+
+        idx = self.window.table_model.index(0, 2)
+        self.window.table_view.setCurrentIndex(idx)
+        self.window.table_view.edit(idx)
+        editor = self.window.table_view.viewport().findChild(QLineEdit)
+        self.assertIsNotNone(editor)
+        assert editor is not None
+        editor.setText("42.00")
+
+        self.mock_question.reset_mock()
+        self.mock_question.return_value = QMessageBox.StandardButton.No
+        self.window._create_new_recipe()
+        self.mock_question.assert_called_once()
+        self.assertTrue(self.window._is_dirty)
+
+        self.mock_question.reset_mock()
+        self.mock_question.return_value = QMessageBox.StandardButton.Cancel
+        with patch("tared.ui.views.main_window.DataTransferDialog") as mock_dt:
+            self.window._open_data_transfer_dialog()
+            self.mock_question.assert_called_once()
+            mock_dt.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

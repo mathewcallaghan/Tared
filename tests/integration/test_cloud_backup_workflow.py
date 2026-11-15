@@ -209,6 +209,37 @@ class TestCloudBackupWorkflow(unittest.TestCase):
 
         transfer_dlg.close()
 
+    def test_auto_backup_expands_tilde_in_backup_dir(self) -> None:
+        import os
+
+        from tared.ui.views.print_dialog import PrintBatchSheetDialog
+
+        fake_home = self.base_path / "fake_home"
+        tilde_target = fake_home / "Tared_Tilde_Sync"
+        tilde_target.mkdir(parents=True)
+        self.config.auto_backup_dir = "~/Tared_Tilde_Sync"
+        try:
+            with patch.dict(os.environ, {"HOME": str(fake_home)}):
+                self.assertTrue(self.config.is_backup_configured())
+                self.assertTrue(self.window._trigger_auto_backup(silent=True))
+                backup_file = tilde_target / "tared_workspace.json"
+                self.assertTrue(backup_file.is_file())
+
+                batch = self.window.table_model.current_batch
+                assert batch is not None
+                dialog = PrintBatchSheetDialog(batch, parent=self.window, repository=self.repo, config=self.config)
+                dialog.operator_input.setText("Tilde Operator")
+                dialog.batch_num_input.setText("BAT-TILDE-01")
+                pdf_out = str(self.base_path / "tilde_sheet.pdf")
+                with patch("PyQt6.QtWidgets.QFileDialog.getSaveFileName", return_value=(pdf_out, "PDF Files (*.pdf)")):
+                    dialog._export_pdf()
+                dialog.close()
+
+                updated = json.loads(backup_file.read_text(encoding="utf-8"))
+                self.assertIn("BAT-TILDE-01", [b["batch_number"] for b in updated["batches"]])
+        finally:
+            self.config.auto_backup_dir = str(self.cloud_sync_dir)
+
 
 if __name__ == "__main__":
     unittest.main()

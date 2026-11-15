@@ -112,7 +112,7 @@ jobs:
           elif [ -n "${{ inputs.tag_name }}" ]; then
             echo "name=${{ inputs.tag_name }}" >> "$GITHUB_OUTPUT"
           else
-            VERSION=$(python3 -c "import re, pathlib; content = pathlib.Path('src/tared/__init__.py').read_text(); print(re.search(r'__version__\s*=\s*[\"\'\']([^\"\'\']+)[\"\'\']', content).group(1))")
+            VERSION=$(python3 -c 'import pathlib, re; content = pathlib.Path("src/tared/__init__.py").read_text(encoding="utf-8"); print(re.search(r"__version__\s*=\s*[\x22\x27]([^\x22\x27]+)[\x22\x27]", content).group(1))')
             echo "name=v${VERSION}" >> "$GITHUB_OUTPUT"
           fi
 

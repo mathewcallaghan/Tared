@@ -13,9 +13,21 @@ from typing import Any
 
 from tared.core.models import CatalogIngredient, Ingredient, Recipe
 from tared.core.service import has_formulation_changed
-from tared.storage.base import DuplicateBatchNumberError, RecipeNotFoundError, RecipeRepository, StorageError
+from tared.storage.base import (
+    DuplicateBatchNumberError,
+    RecipeNotFoundError,
+    RecipeRepository,
+    StorageError,
+    parse_bool_flag,
+)
 
 logger = logging.getLogger(__name__)
+_ASCII_NOCASE_TABLE = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _sqlite_nocase_key(name: str) -> str:
+    """Fold ASCII letters only to match SQLite COLLATE NOCASE semantics."""
+    return name.strip().translate(_ASCII_NOCASE_TABLE)
 
 
 class SQLiteRecipeRepository(RecipeRepository):
@@ -32,7 +44,7 @@ class SQLiteRecipeRepository(RecipeRepository):
         self._init_db()
 
     def _create_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, uri=True)
+        conn = sqlite3.connect(self.db_path, uri=self.db_path.startswith("file:"))
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
         if not self._is_memory:
@@ -46,6 +58,13 @@ class SQLiteRecipeRepository(RecipeRepository):
 
     def _init_db(self) -> None:
         conn = self._get_connection()
+        try:
+            self._init_db_on_connection(conn)
+        finally:
+            if not self._is_memory:
+                conn.close()
+
+    def _init_db_on_connection(self, conn: sqlite3.Connection) -> None:
         with conn:
             conn.executescript(
                 """
@@ -90,6 +109,13 @@ class SQLiteRecipeRepository(RecipeRepository):
 
                 CREATE TRIGGER IF NOT EXISTS prevent_revision_delete
                 BEFORE DELETE ON recipe_revisions
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM recipes
+                    WHERE id = OLD.recipe_id AND is_archived = 1
+                ) OR EXISTS (
+                    SELECT 1 FROM batches
+                    WHERE recipe_id = OLD.recipe_id
+                )
                 BEGIN
                     SELECT RAISE(ABORT, 'Recipe revisions are immutable and cannot be deleted.');
                 END;
@@ -99,7 +125,7 @@ class SQLiteRecipeRepository(RecipeRepository):
                     id TEXT PRIMARY KEY,
                     recipe_id TEXT NOT NULL,
                     recipe_version INTEGER NOT NULL,
-                    batch_number TEXT NOT NULL UNIQUE,
+                    batch_number TEXT NOT NULL UNIQUE COLLATE NOCASE,
                     operator TEXT NOT NULL,
                     precision TEXT NOT NULL DEFAULT '0.01',
                     target_weight TEXT NOT NULL,
@@ -108,6 +134,7 @@ class SQLiteRecipeRepository(RecipeRepository):
                     items_json TEXT NOT NULL DEFAULT '[]',
                     notes TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
+                    cost_decimals INTEGER,
                     FOREIGN KEY (recipe_id, recipe_version)
                         REFERENCES recipe_revisions (recipe_id, version) ON DELETE RESTRICT
                 );
@@ -210,8 +237,50 @@ class SQLiteRecipeRepository(RecipeRepository):
                     conn.execute("ALTER TABLE recipes ADD COLUMN is_draft INTEGER NOT NULL DEFAULT 0;")
                 conn.execute("PRAGMA user_version = 2;")
 
-        if not self._is_memory:
-            conn.close()
+            if user_version < 3:
+                conn.execute("DROP TRIGGER IF EXISTS prevent_revision_delete;")
+                conn.execute(
+                    """
+                    CREATE TRIGGER prevent_revision_delete
+                    BEFORE DELETE ON recipe_revisions
+                    WHEN NOT EXISTS (
+                        SELECT 1 FROM recipes
+                        WHERE id = OLD.recipe_id AND is_archived = 1
+                    ) OR EXISTS (
+                        SELECT 1 FROM batches
+                        WHERE recipe_id = OLD.recipe_id
+                    )
+                    BEGIN
+                        SELECT RAISE(ABORT, 'Recipe revisions are immutable and cannot be deleted.');
+                    END;
+                    """
+                )
+                conn.execute("PRAGMA user_version = 3;")
+
+            if user_version < 4:
+                batch_cursor = conn.execute("PRAGMA table_info(batches);")
+                batch_cols = [row["name"] for row in batch_cursor.fetchall()]
+                if "cost_decimals" not in batch_cols:
+                    conn.execute("ALTER TABLE batches ADD COLUMN cost_decimals INTEGER;")
+                conn.execute("PRAGMA user_version = 4;")
+
+            if user_version < 5:
+                try:
+                    conn.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_batches_batch_number_nocase "
+                        "ON batches(batch_number COLLATE NOCASE);"
+                    )
+                except sqlite3.IntegrityError as err:
+                    dupes = conn.execute(
+                        "SELECT GROUP_CONCAT(batch_number, ', ') AS conflicting "
+                        "FROM batches GROUP BY batch_number COLLATE NOCASE HAVING COUNT(*) > 1;"
+                    ).fetchall()
+                    conflict_str = "; ".join(row["conflicting"] for row in dupes if row["conflicting"])
+                    raise StorageError(
+                        "Cannot migrate database to v5: existing production batches have case-colliding "
+                        f"batch numbers ({conflict_str or 'unknown'}). Resolve duplicate identifiers before upgrading."
+                    ) from err
+                conn.execute("PRAGMA user_version = 5;")
 
     def _is_revision_equivalent(self, rev_row: sqlite3.Row | dict[str, Any], recipe: Recipe) -> bool:
         """Compare revision snapshot semantically against a Recipe candidate using Decimal values."""
@@ -421,11 +490,20 @@ class SQLiteRecipeRepository(RecipeRepository):
         created_at: str | None = None,
         precision: str | Decimal = Decimal("0.01"),
         items: Any = None,
+        cost_decimals: int | None = None,
     ) -> str:
         """Log a completed production batch run referencing an immutable recipe revision."""
         clean_batch_number = str(batch_number).strip()
         if not clean_batch_number:
             raise ValueError("Batch number cannot be empty")
+
+        resolved_cost_decimals: int | None = None
+        if cost_decimals is not None:
+            if isinstance(cost_decimals, (bool, float)):
+                raise ValueError("cost_decimals must be an integer or None")
+            resolved_cost_decimals = int(cost_decimals)
+            if resolved_cost_decimals < 0 or resolved_cost_decimals > 10:
+                raise ValueError(f"cost_decimals must be between 0 and 10, got {resolved_cost_decimals}")
 
         if created_at is None:
             created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -459,9 +537,9 @@ class SQLiteRecipeRepository(RecipeRepository):
                     INSERT INTO batches (
                         id, recipe_id, recipe_version, batch_number, operator,
                         precision, target_weight, total_weight, total_cost,
-                        items_json, notes, created_at
+                        items_json, notes, created_at, cost_decimals
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                     """,
                     (
                         batch_id,
@@ -476,6 +554,7 @@ class SQLiteRecipeRepository(RecipeRepository):
                         items_json,
                         notes,
                         created_at,
+                        resolved_cost_decimals,
                     ),
                 )
             return batch_id
@@ -500,7 +579,7 @@ class SQLiteRecipeRepository(RecipeRepository):
         conn = self._get_connection()
         try:
             row = conn.execute(
-                "SELECT 1 FROM batches WHERE batch_number = ? LIMIT 1;",
+                "SELECT 1 FROM batches WHERE batch_number = ? COLLATE NOCASE LIMIT 1;",
                 (batch_number.strip(),),
             ).fetchone()
             return row is not None
@@ -524,26 +603,24 @@ class SQLiteRecipeRepository(RecipeRepository):
             if not self._is_memory:
                 conn.close()
 
-    def get_corrupted_recipes(self) -> list[dict[str, Any]]:
-        """Identify active recipes that have no ingredients or invalid formulation data."""
+    def get_corrupted_recipes(self, include_archived: bool = False) -> list[dict[str, Any]]:
+        """Identify recipes that have no ingredients or invalid formulation data."""
         conn = self._get_connection()
         try:
-            recipe_rows = conn.execute(
-                "SELECT id, name, description, version, updated_at FROM recipes "
-                "WHERE is_archived = 0 ORDER BY name ASC;"
-            ).fetchall()
+            query = "SELECT id, name, description, version, updated_at FROM recipes "
+            if not include_archived:
+                query += "WHERE is_archived = 0 "
+            query += "ORDER BY name ASC;"
+            recipe_rows = conn.execute(query).fetchall()
 
             if not recipe_rows:
                 return []
 
-            ingredient_rows = conn.execute(
-                """
-                SELECT recipe_id, name, percentage, cost_per_unit
-                FROM ingredients
-                WHERE recipe_id IN (SELECT id FROM recipes WHERE is_archived = 0)
-                ORDER BY recipe_id, sort_order ASC;
-                """
-            ).fetchall()
+            ing_query = "SELECT recipe_id, name, percentage, cost_per_unit FROM ingredients "
+            if not include_archived:
+                ing_query += "WHERE recipe_id IN (SELECT id FROM recipes WHERE is_archived = 0) "
+            ing_query += "ORDER BY recipe_id, sort_order ASC;"
+            ingredient_rows = conn.execute(ing_query).fetchall()
 
             raw_ingredients_by_recipe: dict[str, list[dict[str, Any]]] = {}
             for row in ingredient_rows:
@@ -747,6 +824,39 @@ class SQLiteRecipeRepository(RecipeRepository):
             if not self._is_memory:
                 conn.close()
 
+    def delete_archived_recipe(self, recipe_id: str) -> bool:
+        """Permanently delete an archived recipe that has zero recorded production batches."""
+        conn = self._get_connection()
+        try:
+            with conn:
+                row = conn.execute(
+                    "SELECT is_archived FROM recipes WHERE id = ?;",
+                    (recipe_id,),
+                ).fetchone()
+                if row is None:
+                    return False
+                if not bool(row["is_archived"]):
+                    raise StorageError("Only archived formulas can be permanently deleted.")
+
+                batch_count = conn.execute(
+                    "SELECT COUNT(*) FROM batches WHERE recipe_id = ?;",
+                    (recipe_id,),
+                ).fetchone()[0]
+                if batch_count > 0:
+                    raise StorageError(
+                        f"Cannot permanently delete formula: {batch_count} production batch record(s) reference it."
+                    )
+
+                conn.execute("DELETE FROM recipe_revisions WHERE recipe_id = ?;", (recipe_id,))
+                cursor = conn.execute(
+                    "DELETE FROM recipes WHERE id = ? AND is_archived = 1;",
+                    (recipe_id,),
+                )
+                return cursor.rowcount > 0
+        finally:
+            if not self._is_memory:
+                conn.close()
+
     def get_catalog_ingredient(self, name: str) -> CatalogIngredient | None:
         conn = self._get_connection()
         try:
@@ -777,7 +887,7 @@ class SQLiteRecipeRepository(RecipeRepository):
                 "SELECT id, name, cost_per_unit, supplier, sku, notes, updated_at FROM ingredients_catalog;"
             ).fetchall()
             return {
-                row["name"].strip().lower(): CatalogIngredient(
+                _sqlite_nocase_key(row["name"]): CatalogIngredient(
                     id=row["id"],
                     name=row["name"],
                     cost_per_unit=Decimal(row["cost_per_unit"]),
@@ -830,13 +940,13 @@ class SQLiteRecipeRepository(RecipeRepository):
                 existing_rows = conn.execute(
                     "SELECT id, name FROM ingredients_catalog;"
                 ).fetchall()
-                existing_by_name = {row["name"].strip().lower(): row["id"] for row in existing_rows}
+                existing_by_name = {_sqlite_nocase_key(row["name"]): row["id"] for row in existing_rows}
                 existing_ids = {row["id"] for row in existing_rows}
 
                 records = []
                 for item in items:
                     clean_name = item.name.strip()
-                    lower_name = clean_name.lower()
+                    lower_name = _sqlite_nocase_key(clean_name)
                     if lower_name in existing_by_name:
                         resolved_id = existing_by_name[lower_name]
                     else:
@@ -1015,8 +1125,12 @@ class SQLiteRecipeRepository(RecipeRepository):
     def export_workspace_snapshot(self) -> dict[str, Any]:
         """Atomically read all workspace entities within a single read connection and transaction."""
         conn = self._get_connection()
+        started_tx = False
         try:
-            with conn:
+            if not conn.in_transaction:
+                conn.execute("BEGIN;")
+                started_tx = True
+            try:
                 cat_rows = conn.execute(
                     "SELECT id, name, cost_per_unit, supplier, sku, notes, updated_at "
                     "FROM ingredients_catalog ORDER BY name COLLATE NOCASE ASC;"
@@ -1081,7 +1195,7 @@ class SQLiteRecipeRepository(RecipeRepository):
 
                 batch_rows = conn.execute(
                     "SELECT id, recipe_id, recipe_version, batch_number, operator, precision, "
-                    "target_weight, total_weight, total_cost, items_json, notes, created_at "
+                    "target_weight, total_weight, total_cost, items_json, notes, created_at, cost_decimals "
                     "FROM batches ORDER BY created_at DESC;"
                 ).fetchall()
                 batches = [dict(row) for row in batch_rows]
@@ -1092,6 +1206,9 @@ class SQLiteRecipeRepository(RecipeRepository):
                     "revisions": revisions,
                     "batches": batches,
                 }
+            finally:
+                if started_tx and conn.in_transaction:
+                    conn.rollback()
         finally:
             if not self._is_memory:
                 conn.close()
@@ -1129,19 +1246,38 @@ class SQLiteRecipeRepository(RecipeRepository):
             revisions_data = [
                 {
                     "id": str(uuid.uuid4()),
-                    "recipe_id": r["id"],
-                    "version": r["version"],
-                    "name": r["name"],
-                    "description": r.get("description", ""),
-                    "ingredients_json": json.dumps(r.get("ingredients", [])),
-                    "created_at": r.get("updated_at", "") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "recipe_id": str(r["id"]).strip(),
+                    "version": r["version"] if r.get("version") is not None else 1,
+                    "name": str(r["name"]).strip(),
+                    "description": str(r.get("description") or ""),
+                    "ingredients_json": json.dumps(
+                        [
+                            {
+                                "name": str(ing["name"]).strip(),
+                                "percentage": str(ing["percentage"]),
+                                "cost_per_unit": str(
+                                    ing.get("cost_per_unit") if ing.get("cost_per_unit") is not None else "0.00"
+                                ),
+                            }
+                            for ing in (r.get("ingredients") or [])
+                        ]
+                    ),
+                    "created_at": str(
+                        r.get("updated_at") or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                    ),
                 }
                 for r in recipes_data
-                if not r.get("is_draft", 0)
+                if not parse_bool_flag(r.get("is_draft", 0))
             ]
 
         def _populate_connection(target_conn: sqlite3.Connection) -> None:
             target_conn.execute("PRAGMA foreign_keys = OFF;")
+            try:
+                _populate_tables(target_conn)
+            finally:
+                target_conn.execute("PRAGMA foreign_keys = ON;")
+
+        def _populate_tables(target_conn: sqlite3.Connection) -> None:
             with target_conn:
                 # Clear existing rows
                 target_conn.execute("DELETE FROM batches;")
@@ -1152,30 +1288,32 @@ class SQLiteRecipeRepository(RecipeRepository):
 
                 # 1. Recipes & Ingredients
                 for r in recipes_data:
+                    r_id = str(r["id"]).strip()
                     target_conn.execute(
                         "INSERT INTO recipes (id, name, description, version, updated_at, is_archived, is_draft) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?);",
                         (
-                            r["id"],
-                            r["name"],
-                            r.get("description", ""),
-                            r.get("version", 1),
-                            r.get("updated_at", ""),
-                            r.get("is_archived", 0),
-                            1 if r.get("is_draft", 0) else 0,
+                            r_id,
+                            str(r["name"]).strip(),
+                            str(r.get("description") or ""),
+                            r["version"] if r.get("version") is not None else 1,
+                            str(r.get("updated_at") or ""),
+                            1 if parse_bool_flag(r.get("is_archived", 0)) else 0,
+                            1 if parse_bool_flag(r.get("is_draft", 0)) else 0,
                         ),
                     )
-                    ings = r.get("ingredients", [])
+                    ings = r.get("ingredients") or []
                     for idx, ing in enumerate(ings):
+                        ing_cost = ing.get("cost_per_unit")
                         target_conn.execute(
                             "INSERT INTO ingredients (recipe_id, sort_order, name, percentage, cost_per_unit) "
                             "VALUES (?, ?, ?, ?, ?);",
                             (
-                                r["id"],
+                                r_id,
                                 idx,
-                                ing["name"],
+                                str(ing["name"]).strip(),
                                 str(ing["percentage"]),
-                                str(ing.get("cost_per_unit", "0.00")),
+                                str(ing_cost if ing_cost is not None else "0.00"),
                             ),
                         )
 
@@ -1186,55 +1324,64 @@ class SQLiteRecipeRepository(RecipeRepository):
                         "(id, recipe_id, version, name, description, ingredients_json, created_at) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?);",
                         (
-                            rev.get("id", str(uuid.uuid4())),
-                            rev["recipe_id"],
+                            str(rev.get("id") or uuid.uuid4()).strip(),
+                            str(rev["recipe_id"]).strip(),
                             rev["version"],
-                            rev["name"],
-                            rev.get("description", ""),
+                            str(rev["name"]).strip(),
+                            str(rev.get("description") or ""),
                             rev["ingredients_json"],
-                            rev.get("created_at", ""),
+                            str(rev.get("created_at") or ""),
                         ),
                     )
 
                 # 3. Batches
                 for b in batches_data:
+                    raw_cd = b.get("cost_decimals")
+                    if raw_cd is None:
+                        cd_val = None
+                    else:
+                        if isinstance(raw_cd, (bool, float)):
+                            raise ValueError("Invalid cost_decimals in batch restore payload.")
+                        cd_val = int(raw_cd)
+                        if cd_val < 0 or cd_val > 10:
+                            raise ValueError(f"Invalid cost_decimals in batch restore payload: {cd_val}")
                     target_conn.execute(
                         "INSERT INTO batches (id, recipe_id, recipe_version, batch_number, operator, precision, "
-                        "target_weight, total_weight, total_cost, items_json, notes, created_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
+                        "target_weight, total_weight, total_cost, items_json, notes, created_at, cost_decimals) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);",
                         (
-                            b.get("id", str(uuid.uuid4())),
-                            b["recipe_id"],
+                            str(b.get("id") or uuid.uuid4()).strip(),
+                            str(b["recipe_id"]).strip(),
                             b["recipe_version"],
-                            b["batch_number"],
-                            b["operator"],
-                            b.get("precision", "0.01"),
+                            str(b["batch_number"]).strip(),
+                            str(b.get("operator") or ""),
+                            str(b.get("precision") or "0.01"),
                             str(b["target_weight"]),
                             str(b["total_weight"]),
                             str(b["total_cost"]),
-                            b.get("items_json", "[]"),
-                            b.get("notes", ""),
-                            b.get("created_at", ""),
+                            str(b.get("items_json") or "[]"),
+                            str(b.get("notes") or ""),
+                            str(b.get("created_at") or ""),
+                            cd_val,
                         ),
                     )
 
                 # 4. Master Catalog
                 for c in catalog_data:
+                    cat_cost = c.get("cost_per_unit")
                     target_conn.execute(
                         "INSERT INTO ingredients_catalog (id, name, cost_per_unit, supplier, sku, notes, updated_at) "
                         "VALUES (?, ?, ?, ?, ?, ?, ?);",
                         (
-                            c.get("id", str(uuid.uuid4())),
-                            c["name"],
-                            str(c.get("cost_per_unit", "0.00")),
-                            c.get("supplier", ""),
-                            c.get("sku", ""),
-                            c.get("notes", ""),
-                            c.get("updated_at", ""),
+                            str(c.get("id") or uuid.uuid4()).strip(),
+                            str(c["name"]).strip(),
+                            str(cat_cost if cat_cost is not None else "0.00"),
+                            str(c.get("supplier") or ""),
+                            str(c.get("sku") or ""),
+                            str(c.get("notes") or ""),
+                            str(c.get("updated_at") or ""),
                         ),
                     )
-
-            target_conn.execute("PRAGMA foreign_keys = ON;")
 
         def _verify_fk(target_conn: sqlite3.Connection) -> None:
             fk_violations = target_conn.execute("PRAGMA foreign_key_check;").fetchall()
@@ -1243,19 +1390,18 @@ class SQLiteRecipeRepository(RecipeRepository):
                 raise StorageError(f"Foreign key integrity check failed after restore: {'; '.join(details)}")
 
         if self._is_memory:
-            conn = self._get_connection()
-            conn.execute("PRAGMA foreign_keys = OFF;")
-            conn.executescript("""
-                DROP TABLE IF EXISTS batches;
-                DROP TABLE IF EXISTS recipe_revisions;
-                DROP TABLE IF EXISTS ingredients;
-                DROP TABLE IF EXISTS recipes;
-                DROP TABLE IF EXISTS ingredients_catalog;
-            """)
-            self._init_db()
-            _populate_connection(conn)
-            conn.execute("PRAGMA foreign_keys = ON;")
-            _verify_fk(conn)
+            staged_mem = sqlite3.connect(":memory:")
+            staged_mem.row_factory = sqlite3.Row
+            staged_mem.execute("PRAGMA foreign_keys = ON;")
+            try:
+                self._init_db_on_connection(staged_mem)
+                _populate_connection(staged_mem)
+                _verify_fk(staged_mem)
+                conn = self._get_connection()
+                staged_mem.backup(conn)
+                conn.execute("PRAGMA foreign_keys = ON;")
+            finally:
+                staged_mem.close()
             return None
 
         # On-disk atomic replacement with safety backup
@@ -1320,11 +1466,16 @@ class SQLiteRecipeRepository(RecipeRepository):
             self._init_db()
             return safety_backup_path
         finally:
-            if staged_db_path.exists():
-                try:
-                    staged_db_path.unlink()
-                except OSError:
-                    pass
+            for stage_file in (
+                staged_db_path,
+                staged_db_path.with_name(staged_db_path.name + "-wal"),
+                staged_db_path.with_name(staged_db_path.name + "-shm"),
+            ):
+                if stage_file.exists():
+                    try:
+                        stage_file.unlink()
+                    except OSError:
+                        pass
 
     def reset_workspace_data(
         self,
@@ -1354,16 +1505,17 @@ class SQLiteRecipeRepository(RecipeRepository):
                 logger.warning("Could not create pre-reset JSON snapshot: %s", json_err)
 
             try:
-                existing_baks = sorted(
-                    dest_dir.glob("recipes_pre_reset_*.bak"),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-                for old_bak in existing_baks[5:]:
-                    try:
-                        old_bak.unlink()
-                    except OSError:
-                        pass
+                for pattern in ("recipes_pre_reset_*.bak", "recipes_pre_reset_*.json"):
+                    existing_snaps = sorted(
+                        dest_dir.glob(pattern),
+                        key=lambda p: p.stat().st_mtime,
+                        reverse=True,
+                    )
+                    for old_snap in existing_snaps[5:]:
+                        try:
+                            old_snap.unlink()
+                        except OSError:
+                            pass
             except Exception:
                 pass
 
@@ -1377,7 +1529,9 @@ class SQLiteRecipeRepository(RecipeRepository):
                 conn.execute("DROP TABLE IF EXISTS recipes;")
                 conn.execute("DROP TABLE IF EXISTS ingredients_catalog;")
         finally:
-            if not self._is_memory:
+            if self._is_memory:
+                conn.execute("PRAGMA foreign_keys = ON;")
+            else:
                 conn.close()
 
         self._init_db()

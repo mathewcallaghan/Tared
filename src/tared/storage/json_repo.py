@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from tared.core.models import Ingredient, Recipe
+from tared.storage.base import parse_bool_flag
 
 
 def recipe_to_dict(recipe: Recipe) -> dict[str, Any]:
@@ -38,6 +39,10 @@ def recipe_from_dict(data: dict[str, Any]) -> Recipe:
     if "name" not in data or "ingredients" not in data:
         raise ValueError("Malformed recipe JSON: missing required 'name' or 'ingredients' keys")
 
+    raw_name = data["name"]
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        raise ValueError("Malformed recipe JSON: 'name' must be a non-empty string")
+
     schema_version = str(data.get("version", "1.0"))
     if schema_version != "1.0":
         raise ValueError(f"Unsupported recipe schema version: '{schema_version}' (expected '1.0')")
@@ -50,11 +55,13 @@ def recipe_from_dict(data: dict[str, Any]) -> Recipe:
     for item in raw_ingredients:
         if not isinstance(item, dict):
             raise ValueError("Malformed recipe JSON: ingredient item must be an object.")
-        name = str(item.get("name", "")).strip()
-        if not name:
+        raw_ing_name = item.get("name")
+        if not isinstance(raw_ing_name, str) or not raw_ing_name.strip():
             raise ValueError("Malformed recipe JSON: ingredient name cannot be empty")
+        name = raw_ing_name.strip()
         pct_str = str(item.get("percentage", "")).replace(",", ".")
-        cost_str = str(item.get("cost_per_unit", "0.00")).replace(",", ".")
+        raw_cost = item.get("cost_per_unit")
+        cost_str = str(raw_cost if raw_cost is not None else "0.00").replace(",", ".")
         try:
             parsed_ingredients.append(
                 Ingredient(
@@ -67,16 +74,22 @@ def recipe_from_dict(data: dict[str, Any]) -> Recipe:
             raise ValueError(f"Malformed ingredient numeric data for '{name}': {err}") from err
 
     raw_id = data.get("id")
-    recipe_id = str(raw_id).strip() if raw_id and str(raw_id).strip() else str(uuid.uuid4())
+    recipe_id = str(raw_id).strip() if raw_id is not None and str(raw_id).strip() else str(uuid.uuid4())
 
     try:
+        raw_ver = data.get("recipe_version")
+        if isinstance(raw_ver, (bool, float)):
+            raise ValueError("'recipe_version' must be an integer")
+        recipe_version = 1 if raw_ver is None else int(raw_ver)
+        if recipe_version < 1:
+            raise ValueError("'recipe_version' must be >= 1")
         return Recipe(
             id=recipe_id,
-            name=str(data["name"]).strip(),
+            name=raw_name.strip(),
             description=str(data.get("description") or ""),
-            version=int(data.get("recipe_version", 1)),
+            version=recipe_version,
             updated_at=str(data.get("updated_at") or ""),
-            is_draft=bool(data.get("is_draft", False)),
+            is_draft=parse_bool_flag(data.get("is_draft", False)),
             ingredients=tuple(parsed_ingredients),
         )
     except Exception as err:

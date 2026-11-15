@@ -14,8 +14,8 @@ from typing import Any
 import tared
 from tared.core.calculator import PercentageSumError, validate_recipe_percentages
 from tared.core.models import CatalogIngredient, Ingredient, Recipe
-from tared.storage.base import RecipeRepository
-from tared.storage.sqlite_repo import SQLiteRecipeRepository
+from tared.storage.base import RecipeRepository, parse_bool_flag
+from tared.storage.sqlite_repo import _sqlite_nocase_key
 
 WORKSPACE_SCHEMA_VERSION = "1.0"
 CATALOG_SCHEMA_VERSION = "1.0"
@@ -60,7 +60,7 @@ def export_workspace_to_dict(repo: RecipeRepository) -> dict[str, Any]:
 
 
 def export_workspace_to_json_file(
-    repo: SQLiteRecipeRepository,
+    repo: RecipeRepository,
     file_path: str | Path,
     indent: int = 2,
     max_rotations: int = 0,
@@ -133,14 +133,28 @@ def inspect_workspace_file(file_path: str | Path) -> dict[str, Any]:
         raise ValueError("Malformed workspace backup: 'revisions' must be a list.")
 
     # 1. Validate catalog items
+    seen_catalog_ids: set[str] = set()
+    seen_catalog_names: set[str] = set()
     for idx, c in enumerate(catalog):
         if not isinstance(c, dict):
             raise ValueError(f"Malformed catalog item at index {idx}: must be an object.")
-        name = str(c.get("name", "")).strip()
-        if not name:
-            raise ValueError(f"Malformed catalog item at index {idx}: name cannot be empty.")
+        raw_cat_id = c.get("id")
+        if raw_cat_id is not None and str(raw_cat_id).strip():
+            cat_id = str(raw_cat_id).strip()
+            if cat_id in seen_catalog_ids:
+                raise ValueError(f"Duplicate catalog ID '{cat_id}' found in workspace backup.")
+            seen_catalog_ids.add(cat_id)
+        raw_cat_name = c.get("name")
+        if not isinstance(raw_cat_name, str) or not raw_cat_name.strip():
+            raise ValueError(f"Malformed catalog item at index {idx}: name must be a non-empty string.")
+        name = raw_cat_name.strip()
+        cat_key = _sqlite_nocase_key(name)
+        if cat_key in seen_catalog_names:
+            raise ValueError(f"Duplicate catalog material name '{name}' found in workspace backup.")
+        seen_catalog_names.add(cat_key)
         try:
-            cost = Decimal(str(c.get("cost_per_unit", "0.00")))
+            raw_cat_cost = c.get("cost_per_unit")
+            cost = Decimal(str(raw_cat_cost if raw_cat_cost is not None else "0.00"))
             if not cost.is_finite() or cost < Decimal("0"):
                 raise ValueError("Cost must be a finite non-negative number")
         except (InvalidOperation, ValueError) as err:
@@ -151,54 +165,80 @@ def inspect_workspace_file(file_path: str | Path) -> dict[str, Any]:
 
     # 2. Structural & referential validation for revision snapshots
     seen_revisions: set[tuple[str, int]] = set()
-    revisions_map: dict[tuple[str, int], list[dict[str, str]]] = {}
+    revisions_map: dict[tuple[str, int], dict[str, Any]] = {}
 
     for idx, rev in enumerate(revisions):
         if not isinstance(rev, dict):
             raise ValueError(f"Malformed revision at index {idx}: entry must be a dictionary.")
-        rec_id = str(rev.get("recipe_id", "")).strip()
-        if not rec_id:
+        raw_rec_id = rev.get("recipe_id")
+        if not isinstance(raw_rec_id, str) or not raw_rec_id.strip():
             raise ValueError(f"Malformed revision at index {idx}: missing required 'recipe_id'.")
+        rec_id = raw_rec_id.strip()
         if "version" not in rev:
             raise ValueError(f"Malformed revision at index {idx}: missing required 'version'.")
+        raw_rev_ver = rev["version"]
+        if isinstance(raw_rev_ver, (bool, float)) or raw_rev_ver is None:
+            raise ValueError(f"Malformed revision at index {idx}: 'version' must be an integer.")
         try:
-            rev_ver = int(rev["version"])
+            rev_ver = int(raw_rev_ver)
         except (ValueError, TypeError) as ver_err:
             raise ValueError(f"Malformed revision at index {idx}: invalid 'version': {ver_err}") from ver_err
+        if rev_ver < 1:
+            raise ValueError(f"Malformed revision at index {idx}: 'version' must be >= 1, got {rev_ver}.")
 
         rev_key = (rec_id, rev_ver)
         if rev_key in seen_revisions:
             raise ValueError(f"Duplicate revision snapshot found for recipe ID '{rec_id}' version {rev_ver}.")
         seen_revisions.add(rev_key)
 
-        rev_name = rev.get("name", f"Revision #{idx + 1}")
+        raw_rev_name = rev.get("name")
+        if not isinstance(raw_rev_name, str) or not raw_rev_name.strip():
+            raise ValueError(f"Malformed revision at index {idx}: 'name' must be a non-empty string.")
+        rev_name = raw_rev_name
         ing_raw = rev.get("ingredients_json", "[]")
         try:
             ing_items = json.loads(ing_raw)
             if not isinstance(ing_items, list) or not ing_items:
                 raise ValueError("ingredients_json must be a non-empty list of ingredients")
-            parsed_rev_ings = tuple(
-                Ingredient(
-                    name=str(it.get("name", "")),
-                    percentage=Decimal(str(it.get("percentage", "0"))),
-                    cost_per_unit=Decimal(str(it.get("cost_per_unit", "0.00"))),
+            parsed_rev_ings = []
+            mapped_rev_ings = []
+            for it in ing_items:
+                if not isinstance(it, dict):
+                    raise ValueError("ingredient entry must be an object")
+                it_name = it.get("name")
+                if not isinstance(it_name, str) or not it_name.strip():
+                    raise ValueError("ingredient name must be a non-empty string")
+                it_pct = it.get("percentage")
+                if it_pct is None:
+                    raise ValueError(f"ingredient '{it_name}' missing percentage")
+                it_cost = it.get("cost_per_unit")
+                cost_str = str(it_cost if it_cost is not None else "0.00")
+                parsed_rev_ings.append(
+                    Ingredient(
+                        name=it_name,
+                        percentage=Decimal(str(it_pct)),
+                        cost_per_unit=Decimal(cost_str),
+                    )
                 )
-                for it in ing_items
-            )
-            revisions_map[rev_key] = [
-                {
-                    "name": str(it.get("name", "")).strip(),
-                    "percentage": str(it.get("percentage", "0")),
-                    "cost_per_unit": str(it.get("cost_per_unit", "0.00")),
-                }
-                for it in ing_items
-            ]
+                mapped_rev_ings.append(
+                    {
+                        "name": it_name.strip(),
+                        "percentage": str(it_pct),
+                        "cost_per_unit": cost_str,
+                    }
+                )
+            rev_desc = str(rev.get("description") or "")
+            revisions_map[rev_key] = {
+                "name": rev_name.strip(),
+                "description": rev_desc,
+                "ingredients": mapped_rev_ings,
+            }
             rev_recipe = Recipe(
                 id=rec_id,
                 name=str(rev_name),
-                description=str(rev.get("description", "")),
+                description=rev_desc,
                 version=rev_ver,
-                ingredients=parsed_rev_ings,
+                ingredients=tuple(parsed_rev_ings),
             )
         except Exception as parse_err:
             raise ValueError(f"Revision '{rev_name}' has invalid ingredients_json: {parse_err}") from parse_err
@@ -210,41 +250,65 @@ def inspect_workspace_file(file_path: str | Path) -> dict[str, Any]:
 
     # 3. Structural, numeric, and cross-revision validation for active/archived recipes
     seen_recipe_ids: set[str] = set()
+    recipe_is_draft_by_id: dict[str, bool] = {}
+    non_draft_recipe_versions: dict[str, int] = {}
     for idx, r in enumerate(recipes):
         if not isinstance(r, dict):
             raise ValueError(f"Malformed recipe at index {idx}: must be an object.")
-        r_id = str(r.get("id", "")).strip()
-        if not r_id:
+        raw_r_id = r.get("id")
+        if not isinstance(raw_r_id, str) or not raw_r_id.strip():
             raise ValueError(f"Malformed recipe at index {idx}: missing required 'id'.")
+        r_id = raw_r_id.strip()
         if r_id in seen_recipe_ids:
             raise ValueError(f"Duplicate recipe ID '{r_id}' found in workspace backup.")
         seen_recipe_ids.add(r_id)
 
-        r_name = str(r.get("name", "")).strip()
-        if not r_name:
+        raw_r_name = r.get("name")
+        if not isinstance(raw_r_name, str) or not raw_r_name.strip():
             raise ValueError(f"Malformed recipe at index {idx}: formula name cannot be empty.")
+        r_name = raw_r_name.strip()
+        raw_r_ver = r.get("version")
+        if isinstance(raw_r_ver, (bool, float)):
+            raise ValueError(f"Recipe '{r_name}' has invalid 'version': must be an integer.")
         try:
-            r_ver = int(r.get("version", 1))
+            r_ver = 1 if raw_r_ver is None else int(raw_r_ver)
         except (ValueError, TypeError) as ver_err:
             raise ValueError(f"Recipe '{r_name}' has invalid 'version': {ver_err}") from ver_err
+        if r_ver < 1:
+            raise ValueError(f"Recipe '{r_name}' has invalid 'version': must be >= 1, got {r_ver}.")
 
         raw_ings = r.get("ingredients", [])
         if not isinstance(raw_ings, list) or not raw_ings:
             raise ValueError(f"Recipe '{r_name}' must contain at least one ingredient.")
-        r_is_draft = bool(r.get("is_draft", 0))
+        r_is_draft = parse_bool_flag(r.get("is_draft", 0))
+        recipe_is_draft_by_id[r_id] = r_is_draft
+        if not r_is_draft:
+            non_draft_recipe_versions[r_id] = r_ver
         try:
-            parsed_ings = tuple(
-                Ingredient(
-                    name=str(it.get("name", "")),
-                    percentage=Decimal(str(it.get("percentage", "0"))),
-                    cost_per_unit=Decimal(str(it.get("cost_per_unit", "0.00"))),
+            parsed_ings_list = []
+            for it in raw_ings:
+                if not isinstance(it, dict):
+                    raise ValueError("ingredient entry must be an object")
+                it_name = it.get("name")
+                if not isinstance(it_name, str) or not it_name.strip():
+                    raise ValueError("ingredient name must be a non-empty string")
+                it_pct = it.get("percentage")
+                if it_pct is None:
+                    raise ValueError(f"ingredient '{it_name}' missing percentage")
+                it_cost = it.get("cost_per_unit")
+                cost_str = str(it_cost if it_cost is not None else "0.00")
+                parsed_ings_list.append(
+                    Ingredient(
+                        name=it_name,
+                        percentage=Decimal(str(it_pct)),
+                        cost_per_unit=Decimal(cost_str),
+                    )
                 )
-                for it in raw_ings
-            )
+            parsed_ings = tuple(parsed_ings_list)
             rec = Recipe(
                 id=r_id,
                 name=r_name,
-                description=str(r.get("description", "")),
+                description=str(r.get("description") or ""),
                 version=r_ver,
                 is_draft=r_is_draft,
                 ingredients=parsed_ings,
@@ -260,7 +324,13 @@ def inspect_workspace_file(file_path: str | Path) -> dict[str, Any]:
                 f"conflicts with an immutable revision snapshot at v{r_ver}."
             )
         if rev_key in revisions_map:
-            rev_ings = revisions_map[rev_key]
+            rev_snap = revisions_map[rev_key]
+            if r_name != rev_snap["name"] or rec.description != rev_snap["description"]:
+                raise ValueError(
+                    f"Integrity violation in backup: Recipe '{r_name}' (id='{r_id}', v{r_ver}) "
+                    f"contradicts its immutable revision snapshot at the same version."
+                )
+            rev_ings = rev_snap["ingredients"]
             if len(rec.ingredients) != len(rev_ings):
                 raise ValueError(
                     f"Integrity violation in backup: Recipe '{r_name}' (id='{r_id}', v{r_ver}) "
@@ -282,47 +352,104 @@ def inspect_workspace_file(file_path: str | Path) -> dict[str, Any]:
         except PercentageSumError:
             draft_recipes.append(r_name)
 
+    for rev in revisions:
+        rev_recipe_id = str(rev.get("recipe_id", "")).strip()
+        if rev_recipe_id not in seen_recipe_ids:
+            rev_label = rev.get("name", "Unknown Revision")
+            raise ValueError(
+                f"Revision '{rev_label}' references non-existent recipe ID '{rev_recipe_id}'."
+            )
+
     # 4. Structural, numeric, and referential validation for historical production batches
     seen_batch_numbers: set[str] = set()
     for idx, b in enumerate(batches):
         if not isinstance(b, dict):
             raise ValueError(f"Malformed batch entry at index {idx}: entry must be a dictionary.")
-        batch_num = str(b.get("batch_number", "")).strip()
-        if not batch_num:
+        raw_batch_num = b.get("batch_number")
+        if not isinstance(raw_batch_num, str) or not raw_batch_num.strip():
             raise ValueError(f"Malformed batch at index {idx}: 'batch_number' cannot be empty.")
-        b_num_key = batch_num.lower()
+        batch_num = raw_batch_num.strip()
+        b_num_key = _sqlite_nocase_key(batch_num)
         if b_num_key in seen_batch_numbers:
             raise ValueError(f"Duplicate batch number '{batch_num}' found in workspace backup.")
         seen_batch_numbers.add(b_num_key)
 
-        b_rec_id = str(b.get("recipe_id", "")).strip()
-        if not b_rec_id:
+        raw_b_rec_id = b.get("recipe_id")
+        if not isinstance(raw_b_rec_id, str) or not raw_b_rec_id.strip():
             raise ValueError(f"Batch '{batch_num}' missing required 'recipe_id'.")
+        b_rec_id = raw_b_rec_id.strip()
+        if "recipe_version" not in b:
+            raise ValueError(f"Batch '{batch_num}' missing required 'recipe_version'.")
+        raw_b_ver = b["recipe_version"]
+        if isinstance(raw_b_ver, (bool, float)) or raw_b_ver is None:
+            raise ValueError(f"Batch '{batch_num}' contains invalid 'recipe_version'.")
+        for req_metric in ("target_weight", "total_weight", "total_cost"):
+            if req_metric not in b or b[req_metric] is None:
+                raise ValueError(f"Batch '{batch_num}' missing required '{req_metric}'.")
         try:
-            b_ver = int(b.get("recipe_version", 1))
-            tw = Decimal(str(b.get("target_weight", "0")))
-            tot_w = Decimal(str(b.get("total_weight", "0")))
-            tot_c = Decimal(str(b.get("total_cost", "0")))
+            b_ver = int(raw_b_ver)
+            tw = Decimal(str(b["target_weight"]))
+            tot_w = Decimal(str(b["total_weight"]))
+            tot_c = Decimal(str(b["total_cost"]))
+            raw_prec = b.get("precision")
+            prec_val = Decimal(str(raw_prec if raw_prec not in (None, "") else "0.01"))
             if not (tw.is_finite() and tot_w.is_finite() and tot_c.is_finite()):
                 raise ValueError("Batch metrics must be finite numbers.")
+            if tw <= Decimal("0") or tot_w <= Decimal("0") or tot_c < Decimal("0"):
+                raise ValueError("Batch target/total weight must be positive and total cost non-negative.")
+            if not prec_val.is_finite() or prec_val <= Decimal("0"):
+                raise ValueError("Batch precision must be a finite positive number.")
         except (InvalidOperation, ValueError, TypeError) as err:
             raise ValueError(f"Batch '{batch_num}' contains invalid numeric metrics: {err}") from err
 
-        if revisions and (b_rec_id, b_ver) not in seen_revisions:
-            raise ValueError(
-                f"Batch '{batch_num}' references non-existent recipe revision "
-                f"(recipe_id='{b_rec_id}', version={b_ver})."
-            )
+        if revisions:
+            if (b_rec_id, b_ver) not in seen_revisions:
+                raise ValueError(
+                    f"Batch '{batch_num}' references non-existent recipe revision "
+                    f"(recipe_id='{b_rec_id}', version={b_ver})."
+                )
+        else:
+            if b_rec_id not in seen_recipe_ids:
+                raise ValueError(
+                    f"Batch '{batch_num}' references non-existent recipe ID '{b_rec_id}'."
+                )
+            if recipe_is_draft_by_id.get(b_rec_id, False):
+                raise ValueError(
+                    f"Batch '{batch_num}' references draft recipe ID '{b_rec_id}' which has no committed revisions."
+                )
+            if non_draft_recipe_versions.get(b_rec_id) != b_ver:
+                raise ValueError(
+                    f"Batch '{batch_num}' references recipe version {b_ver}, "
+                    f"which does not match recipe '{b_rec_id}' version {non_draft_recipe_versions.get(b_rec_id)} "
+                    "when revisions are absent."
+                )
 
-        raw_items_json = b.get("items_json", "[]")
+        raw_cost_decimals = b.get("cost_decimals")
+        if raw_cost_decimals is not None:
+            if isinstance(raw_cost_decimals, (bool, float)):
+                raise ValueError(f"Batch '{batch_num}' contains invalid 'cost_decimals'.")
+            try:
+                cd_val = int(raw_cost_decimals)
+            except (ValueError, TypeError) as cd_err:
+                raise ValueError(f"Batch '{batch_num}' contains invalid 'cost_decimals': {cd_err}") from cd_err
+            if cd_val < 0 or cd_val > 10:
+                raise ValueError(
+                    f"Batch '{batch_num}' contains invalid 'cost_decimals': must be between 0 and 10, got {cd_val}."
+                )
+
+        raw_items_json = b.get("items_json")
+        if raw_items_json is None:
+            raw_items_json = "[]"
+        elif not isinstance(raw_items_json, str):
+            raise ValueError(f"Batch '{batch_num}' contains malformed items_json: expected JSON string.")
         try:
             parsed_items = json.loads(raw_items_json)
-            if not isinstance(parsed_items, list):
-                raise ValueError("items_json must be a JSON array")
+            if not isinstance(parsed_items, list) or any(not isinstance(it, dict) for it in parsed_items):
+                raise ValueError("items_json must be a JSON array of ingredient objects")
         except Exception as items_err:
             raise ValueError(f"Batch '{batch_num}' contains malformed items_json: {items_err}") from items_err
 
-    archived_count = sum(1 for r in recipes if isinstance(r, dict) and r.get("is_archived", 0) == 1)
+    archived_count = sum(1 for r in recipes if isinstance(r, dict) and parse_bool_flag(r.get("is_archived", False)))
 
     return {
         "schema_version": schema_version,
@@ -340,7 +467,7 @@ def inspect_workspace_file(file_path: str | Path) -> dict[str, Any]:
 
 
 def restore_workspace_from_json(
-    repo: SQLiteRecipeRepository,
+    repo: RecipeRepository,
     file_path: str | Path,
     pre_restore_backup_dir: str | Path | None = None,
 ) -> Path | None:
@@ -414,32 +541,43 @@ def import_catalog_from_json_file(repo: RecipeRepository, file_path: str | Path)
     except Exception as err:
         raise ValueError(f"Failed to read catalog JSON file: {err}") from err
 
-    raw_items = data.get("catalog", []) if isinstance(data, dict) else data
+    if isinstance(data, dict):
+        if "catalog" not in data:
+            raise ValueError("Invalid catalog format: missing required 'catalog' list.")
+        raw_items = data["catalog"]
+    else:
+        raw_items = data
     if not isinstance(raw_items, list):
         raise ValueError("Invalid catalog format: expected a 'catalog' list of items.")
 
     items_to_save: list[CatalogIngredient] = []
+    seen_names: set[str] = set()
     for idx, it in enumerate(raw_items):
         if not isinstance(it, dict):
             raise ValueError(f"Malformed catalog item at index {idx}: entry must be an object.")
-        name = str(it.get("name", "")).strip()
+        raw_name = it.get("name")
+        if raw_name is None or not isinstance(raw_name, str):
+            raise ValueError(f"Malformed catalog item at index {idx}: 'name' must be a string.")
+        name = raw_name.strip()
         if not name:
             continue
         try:
-            cost = Decimal(str(it.get("cost_per_unit", "0.00")))
+            raw_cost = it.get("cost_per_unit")
+            cost = Decimal(str(raw_cost if raw_cost is not None else "0.00"))
             item = CatalogIngredient(
                 id=str(it.get("id") or uuid.uuid4()),
                 name=name,
                 cost_per_unit=cost,
-                supplier=str(it.get("supplier", "")),
-                sku=str(it.get("sku", "")),
-                notes=str(it.get("notes", "")),
-                updated_at=str(it.get("updated_at", "")),
+                supplier=str(it.get("supplier") or ""),
+                sku=str(it.get("sku") or ""),
+                notes=str(it.get("notes") or ""),
+                updated_at=str(it.get("updated_at") or ""),
             )
             items_to_save.append(item)
+            seen_names.add(_sqlite_nocase_key(name))
         except (InvalidOperation, TypeError, ValueError) as err:
             raise ValueError(f"Invalid catalog item '{name}' numeric data: {err}") from err
 
     if items_to_save:
         repo.save_catalog_ingredients(items_to_save)
-    return len(items_to_save)
+    return len(seen_names)

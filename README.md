@@ -47,9 +47,9 @@ When scaling a formula to a target mass $M$ at scale precision $Q$:
 7. **Largest-Remainder Non-Monotonicity (Alabama Paradox):** Like all largest-remainder discrete allocation algorithms, Hare-Niemeyer allocation is quota-consistent but not strictly population-monotonic. In rare edge conditions at allocation boundaries, scaling a target batch mass up by a single precision quantum can cause an individual component's allocation to decrease by one quantum due to dynamic shifts in fractional remainder ranks.
 
 ### 2. Draft Lifecycle & Revision Archival Semantics
-- **Immutable Revision Progression:** Under Tared's audit model, calling **Save Formula** on any recipe that alters formula name, compounding instructions, ingredient order, percentages, or unit costs generates an immutable snapshot in `recipe_revisions` and increments the recipe version ($v1 \to v2 \to v3$).
-- **In-Progress Drafts:** Formulations that do not yet sum to 100.00% may be saved as drafts with user confirmation. Each save event records an immutable revision snapshot, ensuring work-in-progress can be audited or restored from workspace backups.
-- **Production Gate:** Batch sheet printing and PDF generation remain strictly locked until formula percentages sum to 100.00% ($\pm 0.0001\%$).
+- **Immutable Revision Progression:** Under Tared's audit model, calling **Save Formula** on a finalized recipe that alters formula name, compounding instructions, ingredient order, percentages, or unit costs generates an immutable snapshot in `recipe_revisions` and increments the recipe version ($v1 \to v2 \to v3$).
+- **In-Progress Drafts:** Formulations may be saved in Draft mode (`is_draft=True`)—including incomplete formulas (<100.00%)—via **Save as Draft** or with user confirmation when saving an incomplete formula. Repeated saves in Draft mode update the active draft in place without recording immutable `recipe_revisions` entries until finalized; branching a draft from a finalized revision reserves the next version number while preserving prior committed revisions.
+- **Production Gate:** Batch sheet printing and PDF generation require a finalized immutable revision whose formula percentages sum to 100.00% ($\pm 0.0001\%$).
 
 ### 3. Operational Considerations & System Limits
 - **Units of Measure:** Batch masses are strictly denominated in grams (g) and raw material unit costs in currency per kilogram ($/kg).
@@ -75,15 +75,19 @@ When scaling a formula to a target mass $M$ at scale precision $Q$:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
-pip install -e ".[dev]"
+pip install -e ".[dev,audit]"
 ```
 
-### Running Tests and Linter
+### Running Audits and Tests
+
 ```bash
-# Run unit and integration test suite
+# Run comprehensive audit pipeline (Ruff, Mypy, Bandit, ShellCheck, Coverage, Tests)
+./scripts/audit.sh
+
+# Fast unit test run during active development
 QT_QPA_PLATFORM=offscreen python3 -m unittest discover -s tests -p "test_*.py"
 
-# Run linting check
+# Fast linting check
 pipx run ruff check .
 ```
 

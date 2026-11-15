@@ -71,7 +71,7 @@ class SettingsDialog(QDialog):
         backup_box.addWidget(self.btn_browse_backup)
 
         self.backup_status_label = QLabel()
-        self.backup_status_label.setStyleSheet("font-size: 8.5pt; color: #555;")
+        self.backup_status_label.setStyleSheet("font-size: 8.5pt;")
 
         storage_form = QFormLayout()
         storage_form.addRow("Backup Folder:", backup_box)
@@ -201,6 +201,16 @@ class SettingsDialog(QDialog):
                         return
                 else:
                     return
+
+            if not p.is_dir():
+                QMessageBox.warning(
+                    self,
+                    "Invalid Backup Directory",
+                    f"Specified backup path is not a directory:\n{p}",
+                )
+                self.tabs.setCurrentIndex(0)
+                self.backup_dir_input.setFocus()
+                return
 
             if not os.access(p, os.W_OK):
                 QMessageBox.critical(

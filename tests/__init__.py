@@ -1,5 +1,6 @@
 """Test suite initialization ensuring src root resolution across test runners."""
 
+import atexit
 import sys
 import tempfile
 from pathlib import Path
@@ -12,6 +13,7 @@ try:
     from PyQt6.QtCore import QSettings
 
     _test_settings_dir = tempfile.TemporaryDirectory()
+    atexit.register(_test_settings_dir.cleanup)
     QSettings.setDefaultFormat(QSettings.Format.IniFormat)
     QSettings.setPath(QSettings.Format.IniFormat, QSettings.Scope.UserScope, _test_settings_dir.name)
 except ImportError:

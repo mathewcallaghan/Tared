@@ -93,6 +93,24 @@ class TestCalculatorValidation(unittest.TestCase):
         with self.assertRaises(ValueError):
             compute_batch(recipe, target_weight=Decimal("NaN"))
 
+    def test_boolean_and_non_numeric_string_inputs_rejected_cleanly(self) -> None:
+        recipe = Recipe(
+            name="Clean Type Check",
+            ingredients=(Ingredient(name="Base", percentage=Decimal("100.00")),),
+        )
+        with self.assertRaises(TypeError):
+            compute_batch(recipe, target_weight=True)  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            compute_batch(recipe, target_weight=Decimal("100.00"), precision=False)  # type: ignore[arg-type]
+        with self.assertRaises(TypeError):
+            compute_batch(recipe, target_weight=Decimal("100.00"), currency_precision=True)  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            compute_batch(recipe, target_weight="not-a-number")
+        with self.assertRaises(ValueError):
+            compute_batch(recipe, target_weight="100.00", precision="bad")
+        with self.assertRaises(ValueError):
+            compute_batch(recipe, target_weight="100.00", currency_precision="bad")
+
 
 class TestBatchScalingAndConservation(unittest.TestCase):
     def setUp(self) -> None:
@@ -286,6 +304,18 @@ class TestBatchScalingAndConservation(unittest.TestCase):
         batch = compute_batch(self.recipe, target_weight=Decimal("333.33"), precision=Decimal("0.01"))
         self.assertGreater(batch.max_allocation_deviation, Decimal("0"))
         self.assertLess(batch.max_allocation_deviation, batch.precision)
+
+    def test_batch_result_records_actual_total_percentage(self) -> None:
+        recipe = Recipe(
+            name="Near-100 Tolerance Formula",
+            ingredients=(
+                Ingredient(name="Component A", percentage=Decimal("33.3333")),
+                Ingredient(name="Component B", percentage=Decimal("33.3333")),
+                Ingredient(name="Component C", percentage=Decimal("33.3333")),
+            ),
+        )
+        batch = compute_batch(recipe, target_weight=Decimal("100.00"), precision=Decimal("0.01"))
+        self.assertEqual(batch.total_percentage, Decimal("99.9999"))
 
 
 if __name__ == "__main__":

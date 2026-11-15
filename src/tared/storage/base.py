@@ -20,6 +20,26 @@ class RecipeNotFoundError(StorageError):
     """Raised when a referenced recipe or revision does not exist."""
 
 
+def parse_bool_flag(value: Any, default: bool = False) -> bool:
+    """Parse a boolean flag safely from bool, int (0/1), or canonical string literals."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value in (0, 1):
+            return bool(value)
+        raise ValueError(f"Invalid integer boolean flag: {value!r}")
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        if cleaned in ("true", "1", "yes"):
+            return True
+        if cleaned in ("false", "0", "no"):
+            return False
+        raise ValueError(f"Invalid string boolean flag: {value!r}")
+    raise ValueError(f"Invalid boolean flag type: {type(value).__name__}")
+
+
 class RecipeRepository(ABC):
     """Abstract interface defining recipe persistence and production batch operations."""
 
@@ -52,6 +72,10 @@ class RecipeRepository(ABC):
         """Permanently delete an unreleased draft recipe that has zero revisions and zero batches."""
 
     @abstractmethod
+    def delete_archived_recipe(self, recipe_id: str) -> bool:
+        """Permanently delete an archived recipe that has zero recorded production batches."""
+
+    @abstractmethod
     def get_recipe_revisions(self, recipe_id: str) -> list[dict[str, Any]]:
         """Retrieve historical immutable revision snapshots for a recipe."""
 
@@ -69,6 +93,7 @@ class RecipeRepository(ABC):
         created_at: str | None = None,
         precision: str | Decimal = Decimal("0.01"),
         items: Any = None,
+        cost_decimals: int | None = None,
     ) -> str:
         """Log a completed production batch run referencing an immutable revision."""
 
@@ -133,7 +158,7 @@ class RecipeRepository(ABC):
     def list_all_revisions(self) -> list[dict[str, Any]]:
         """Retrieve all historical immutable revision snapshots across all recipes."""
 
-    def get_corrupted_recipes(self) -> list[dict[str, Any]]:
+    def get_corrupted_recipes(self, include_archived: bool = False) -> list[dict[str, Any]]:
         """Retrieve recipes from storage that fail integrity validation or lack ingredients."""
         return []
 

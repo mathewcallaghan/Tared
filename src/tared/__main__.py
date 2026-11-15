@@ -4,7 +4,7 @@ import argparse
 import os
 import sys
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import tared
@@ -26,16 +26,17 @@ def global_exception_hook(exctype, value, tb) -> None:
     if LOG_FILE is not None:
         try:
             with open(LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(f"\n--- Application Crash: {datetime.now().isoformat()} ---\n")
+                f.write(f"\n--- Application Crash: {datetime.now(timezone.utc).isoformat()} ---\n")
                 f.write(trace_msg)
         except Exception:
             pass
 
     try:
+        from PyQt6.QtCore import QThread
         from PyQt6.QtWidgets import QApplication, QMessageBox
 
         app = QApplication.instance()
-        if app is not None:
+        if app is not None and QThread.currentThread() == app.thread():
             msg = QMessageBox()
             msg.setIcon(QMessageBox.Icon.Critical)
             msg.setWindowTitle("Unexpected Application Error")

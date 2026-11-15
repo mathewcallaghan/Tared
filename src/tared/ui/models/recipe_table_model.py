@@ -1,70 +1,90 @@
 """PyQt6 QAbstractTableModel adapting Recipe and BatchResult for real-time reactivity."""
 
 import decimal
+import re
 from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-try:
+if TYPE_CHECKING:
     from PyQt6.QtCore import QAbstractTableModel, QLocale, QModelIndex, Qt, pyqtSignal
-except ImportError:
+else:
+    try:
+        from PyQt6.QtCore import QAbstractTableModel, QLocale, QModelIndex, Qt, pyqtSignal
+    except ImportError:
 
-    class QAbstractTableModel:
-        pass  # type: ignore
+        class QAbstractTableModel:
+            pass
 
-    class QModelIndex:
-        pass  # type: ignore
+        class QModelIndex:
+            pass
 
-    class QLocale:
-        pass  # type: ignore
+        class QLocale:
+            pass
 
-    class Qt:  # type: ignore
-        class AlignmentFlag:
-            AlignLeft = 1
-            AlignVCenter = 2
-            AlignRight = 4
+        class Qt:
+            class AlignmentFlag:
+                AlignLeft = 1
+                AlignVCenter = 2
+                AlignRight = 4
 
-        class ItemFlag:
-            NoItemFlags = 0
-            ItemIsEnabled = 1
-            ItemIsSelectable = 2
-            ItemIsEditable = 4
+            class ItemFlag:
+                NoItemFlags = 0
+                ItemIsEnabled = 1
+                ItemIsSelectable = 2
+                ItemIsEditable = 4
 
-        class ItemDataRole:
-            DisplayRole = 0
-            EditRole = 2
-            TextAlignmentRole = 4
+            class ItemDataRole:
+                DisplayRole = 0
+                EditRole = 2
+                TextAlignmentRole = 4
 
-        class Orientation:
-            Horizontal = 1
-            Vertical = 2
+            class Orientation:
+                Horizontal = 1
+                Vertical = 2
 
-    def pyqtSignal(*args, **kwargs):  # type: ignore
-        class _Signal:
-            def emit(self, *a, **k):
-                pass
+        def pyqtSignal(*args, **kwargs):
+            class _Signal:
+                def emit(self, *a, **k):
+                    pass
 
-            def connect(self, *a, **k):
-                pass
+                def connect(self, *a, **k):
+                    pass
 
-        return _Signal()
+            return _Signal()
 
 
-from tared.core.calculator import (  # noqa: E402
+from tared.core.calculator import (
     CALCULATION_CONTEXT,
     IncompatibleTargetPrecisionError,
     PercentageSumError,
     RecipeCalculationError,
     compute_batch,
 )
-from tared.core.formatting import determine_cost_precision, format_currency, format_percentage  # noqa: E402
-from tared.core.models import BatchResult, Ingredient, Recipe  # noqa: E402
+from tared.core.formatting import (
+    MAX_UNIT_COST,
+    determine_cost_precision,
+    format_currency,
+    format_percentage,
+)
+from tared.core.models import BatchResult, Ingredient, Recipe
+
+
+def _format_decimal_for_edit(text: str) -> str:
+    try:
+        dec_point = QLocale().decimalPoint()
+    except Exception:
+        dec_point = "."
+    if dec_point and dec_point != ".":
+        return text.replace(".", dec_point)
+    return text
 
 
 def _parse_decimal_input(
     value: Any,
     convert_kg: bool = False,
     allow_mass_units: bool = False,
+    locale: Any = None,
 ) -> Decimal:
     raw = str(value).strip().replace("%", "").replace("$", "").strip()
     if not raw:
@@ -90,41 +110,42 @@ def _parse_decimal_input(
     if not raw:
         raise ValueError("Empty numeric input")
 
-    if any(c in raw for c in ("e", "E")) and not any(c in raw for c in (",", " ")):
-        try:
-            dec = Decimal(raw)
-            if not dec.is_finite():
-                raise ValueError("Non-finite numeric input")
-            if is_kg and convert_kg:
-                dec = dec * Decimal("1000")
-            return dec
-        except Exception as err:
-            raise ValueError(f"Malformed numeric format '{value}'") from err
+    exp_suffix = ""
+    mantissa = raw
+    exp_match = re.search(r"[eE][+-]?\d+$", raw)
+    if exp_match:
+        exp_suffix = exp_match.group(0)
+        mantissa = raw[: exp_match.start()]
+        if not mantissa:
+            raise ValueError(f"Malformed numeric format '{value}'")
 
     try:
-        locale = QLocale()
-        group_sep = locale.groupSeparator()
-        dec_point = locale.decimalPoint()
+        active_locale = locale if locale is not None else QLocale()
+        group_sep = active_locale.groupSeparator()
+        dec_point = active_locale.decimalPoint()
     except Exception:
         group_sep = ","
         dec_point = "."
+
+    if group_sep in (" ", "\xa0", "\u202f"):
+        mantissa = mantissa.replace(" ", group_sep).replace("\xa0", group_sep).replace("\u202f", group_sep)
 
     if not group_sep or not dec_point or group_sep == dec_point:
         group_sep = ","
         dec_point = "."
 
-    if raw.count(dec_point) > 1:
+    if mantissa.count(dec_point) > 1:
         raise ValueError(f"Multiple decimal separators in '{value}'")
 
-    has_dec = dec_point in raw
-    has_group = group_sep in raw
+    has_dec = dec_point in mantissa
+    has_group = group_sep in mantissa
 
     if has_dec and has_group:
-        dec_idx = raw.index(dec_point)
-        last_group_idx = raw.rindex(group_sep)
+        dec_idx = mantissa.index(dec_point)
+        last_group_idx = mantissa.rindex(group_sep)
         if last_group_idx > dec_idx:
             raise ValueError(f"Group separator after decimal separator in '{value}'")
-        int_str, frac_str = raw.split(dec_point, 1)
+        int_str, frac_str = mantissa.split(dec_point, 1)
         if frac_str and not frac_str.isdigit():
             raise ValueError(f"Malformed fractional part in '{value}'")
 
@@ -139,19 +160,21 @@ def _parse_decimal_input(
         normalized = f"{sign}{''.join(parts)}.{frac_str if frac_str else '0'}"
 
     elif has_dec:
-        int_str, frac_str = raw.split(dec_point, 1)
+        int_str, frac_str = mantissa.split(dec_point, 1)
         if frac_str and not frac_str.isdigit():
             raise ValueError(f"Malformed fractional part in '{value}'")
         sign = "-" if int_str.startswith("-") else ("+" if int_str.startswith("+") else "")
         clean_int = int_str[len(sign) :] if sign else int_str
         if clean_int and not clean_int.isdigit():
             raise ValueError(f"Malformed integer part in '{value}'")
+        if not clean_int and not frac_str:
+            raise ValueError(f"Malformed numeric format '{value}'")
         int_digits = clean_int if clean_int else "0"
         normalized = f"{sign}{int_digits}.{frac_str if frac_str else '0'}"
 
     elif has_group:
-        sign = "-" if raw.startswith("-") else ("+" if raw.startswith("+") else "")
-        clean_raw = raw[len(sign) :] if sign else raw
+        sign = "-" if mantissa.startswith("-") else ("+" if mantissa.startswith("+") else "")
+        clean_raw = mantissa[len(sign) :] if sign else mantissa
         parts = clean_raw.split(group_sep)
         if not (1 <= len(parts[0]) <= 3 and parts[0].isdigit()):
             raise ValueError(f"Invalid grouping in '{value}'")
@@ -161,10 +184,10 @@ def _parse_decimal_input(
         normalized = f"{sign}{''.join(parts)}"
 
     else:
-        normalized = raw
+        normalized = mantissa
 
     try:
-        dec = Decimal(normalized)
+        dec = Decimal(f"{normalized}{exp_suffix}")
         if not dec.is_finite():
             raise ValueError("Non-finite numeric input")
         if is_kg and convert_kg:
@@ -232,6 +255,10 @@ class RecipeTableModel(QAbstractTableModel):
         return self._is_draft
 
     @property
+    def target_weight(self) -> Decimal:
+        return self._target_weight
+
+    @property
     def precision(self) -> Decimal:
         return self._precision
 
@@ -241,19 +268,19 @@ class RecipeTableModel(QAbstractTableModel):
 
     @property
     def precision_decimals(self) -> int:
-        exp = self._precision.as_tuple().exponent
+        exp = self._precision.normalize().as_tuple().exponent
         return max(0, -exp) if isinstance(exp, int) else 2
 
     @property
     def ingredients_data(self) -> tuple[dict[str, Any], ...]:
         return tuple(dict(item) for item in self._ingredients)
 
-    def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
+    def rowCount(self, parent: QModelIndex | None = None) -> int:
         if parent is not None and parent.isValid():
             return 0
         return len(self._ingredients)
 
-    def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
+    def columnCount(self, parent: QModelIndex | None = None) -> int:
         if parent is not None and parent.isValid():
             return 0
         return len(COLUMNS)
@@ -290,18 +317,21 @@ class RecipeTableModel(QAbstractTableModel):
             if col == 0:
                 return item["name"]
             if col == 1:
-                return format_percentage(item["percentage"])
+                return _format_decimal_for_edit(format_percentage(item["percentage"]))
             if col == 2:
-                return str(item["cost_per_unit"])
+                return _format_decimal_for_edit(str(item["cost_per_unit"]))
             if col == 3:
                 if self._current_batch is not None and row < len(self._current_batch.items):
-                    return f"{self._current_batch.items[row].scaled_weight:.{self.precision_decimals}f}"
+                    return _format_decimal_for_edit(
+                        f"{self._current_batch.items[row].scaled_weight:.{self.precision_decimals}f}"
+                    )
                 if item.get("weight") is not None and item["weight"] > Decimal("0"):
-                    return f"{item['weight']:.{self.precision_decimals}f}"
+                    return _format_decimal_for_edit(f"{item['weight']:.{self.precision_decimals}f}")
                 if item["percentage"] > Decimal("0"):
-                    raw_w = (item["percentage"] * self._target_weight) / Decimal("100")
-                    return f"{raw_w:.{self.precision_decimals}f}"
-                return "0.00"
+                    with decimal.localcontext(CALCULATION_CONTEXT):
+                        raw_w = (item["percentage"] * self._target_weight) / Decimal("100")
+                    return _format_decimal_for_edit(f"{raw_w:.{self.precision_decimals}f}")
+                return _format_decimal_for_edit(f"{Decimal('0'):.{self.precision_decimals}f}")
             return None
 
         if role in (Qt.ItemDataRole.DisplayRole, 0):
@@ -325,7 +355,8 @@ class RecipeTableModel(QAbstractTableModel):
                 if item.get("weight") is not None and item["weight"] > Decimal("0"):
                     return f"{item['weight']:.{self.precision_decimals}f}"
                 if item["percentage"] > Decimal("0"):
-                    raw_w = (item["percentage"] * self._target_weight) / Decimal("100")
+                    with decimal.localcontext(CALCULATION_CONTEXT):
+                        raw_w = (item["percentage"] * self._target_weight) / Decimal("100")
                     return f"{raw_w:.{self.precision_decimals}f}"
 
             return "—"
@@ -349,6 +380,8 @@ class RecipeTableModel(QAbstractTableModel):
                 if not val_str:
                     self.edit_rejected.emit("Ingredient name cannot be empty.")
                     return False
+                if val_str == self._ingredients[row]["name"]:
+                    return True
                 self._ingredients[row]["name"] = val_str
                 if self._ingredients[row]["cost_per_unit"] == Decimal("0.00") and self._catalog_lookup:
                     default_cost = self._catalog_lookup(val_str)
@@ -356,11 +389,17 @@ class RecipeTableModel(QAbstractTableModel):
                         self._ingredients[row]["cost_per_unit"] = default_cost
                         col_end = 2
             elif col == 1:
-                raw_str = str(value).strip().replace("%", "").strip()
                 current_pct = self._ingredients[row]["percentage"]
-                if raw_str == format_percentage(current_pct) or raw_str == str(current_pct):
-                    return True
-                val_dec = _parse_decimal_input(value, convert_kg=False, allow_mass_units=False)
+                if isinstance(value, Decimal):
+                    if not value.is_finite():
+                        raise ValueError("Non-finite numeric input")
+                    val_dec = value
+                else:
+                    raw_str = str(value).strip().replace("%", "").strip()
+                    formatted_pct = format_percentage(current_pct)
+                    if raw_str == _format_decimal_for_edit(formatted_pct):
+                        return True
+                    val_dec = _parse_decimal_input(value, convert_kg=False, allow_mass_units=False)
                 if val_dec < Decimal("0") or val_dec > Decimal("100.00"):
                     self.edit_rejected.emit(f"Percentage must be between 0.00% and 100.00% (got {val_dec}%).")
                     return False
@@ -371,19 +410,36 @@ class RecipeTableModel(QAbstractTableModel):
                     self._ingredients[row]["weight"] = (val_dec * self._target_weight) / Decimal("100")
                 col_end = 3
             elif col == 2:
-                raw_str = str(value).strip().replace("$", "").strip()
                 current_cost = self._ingredients[row]["cost_per_unit"]
-                if raw_str == str(current_cost):
-                    return True
-                val_dec = _parse_decimal_input(value, convert_kg=False, allow_mass_units=False)
+                if isinstance(value, Decimal):
+                    if not value.is_finite():
+                        raise ValueError("Non-finite numeric input")
+                    val_dec = value
+                else:
+                    raw_str = str(value).strip().replace("$", "").strip()
+                    if raw_str == _format_decimal_for_edit(str(current_cost)):
+                        return True
+                    val_dec = _parse_decimal_input(value, convert_kg=False, allow_mass_units=False)
                 if val_dec < Decimal("0"):
                     self.edit_rejected.emit(f"Unit cost cannot be negative (got {val_dec}).")
+                    return False
+                if val_dec > MAX_UNIT_COST:
+                    self.edit_rejected.emit(f"Unit cost cannot exceed {MAX_UNIT_COST} (got {val_dec}).")
                     return False
                 if val_dec == current_cost:
                     return True
                 self._ingredients[row]["cost_per_unit"] = val_dec
             elif col == 3:
-                val_dec = _parse_decimal_input(value, convert_kg=True, allow_mass_units=True)
+                if isinstance(value, Decimal):
+                    if not value.is_finite():
+                        raise ValueError("Non-finite numeric input")
+                    val_dec = value
+                else:
+                    raw_weight_str = str(value).strip()
+                    current_edit_weight = self.data(index, Qt.ItemDataRole.EditRole)
+                    if current_edit_weight is not None and raw_weight_str == str(current_edit_weight):
+                        return True
+                    val_dec = _parse_decimal_input(value, convert_kg=True, allow_mass_units=True)
                 if val_dec < Decimal("0"):
                     self.edit_rejected.emit(f"Weight cannot be negative (got {val_dec} g).")
                     return False
@@ -430,9 +486,9 @@ class RecipeTableModel(QAbstractTableModel):
             self._recipe_description = description
             self.recalculate()
 
-    def new_draft(self, name: str = "New Formulation", description: str = "") -> None:
+    def new_draft(self, name: str = "New Formulation", description: str = "", recipe_id: str = "") -> None:
         self.beginResetModel()
-        self._recipe_id = ""
+        self._recipe_id = recipe_id
         self._recipe_name = name
         self._recipe_description = description
         self._recipe_version = 1
@@ -451,16 +507,17 @@ class RecipeTableModel(QAbstractTableModel):
         self._recipe_version = recipe.version
         self._recipe_updated_at = recipe.updated_at
         self._is_draft = recipe.is_draft
-        self._ingredients = [
-            {
-                "name": ing.name,
-                "percentage": ing.percentage,
-                "cost_per_unit": ing.cost_per_unit,
-                "weight": (ing.percentage * self._target_weight) / Decimal("100"),
-                "original_order": idx,
-            }
-            for idx, ing in enumerate(recipe.ingredients)
-        ]
+        with decimal.localcontext(CALCULATION_CONTEXT):
+            self._ingredients = [
+                {
+                    "name": ing.name,
+                    "percentage": ing.percentage,
+                    "cost_per_unit": ing.cost_per_unit,
+                    "weight": (ing.percentage * self._target_weight) / Decimal("100"),
+                    "original_order": idx,
+                }
+                for idx, ing in enumerate(recipe.ingredients)
+            ]
         self._next_original_order = len(recipe.ingredients)
         if auto_sort:
             self._ingredients.sort(key=lambda x: x["percentage"], reverse=True)
@@ -488,15 +545,21 @@ class RecipeTableModel(QAbstractTableModel):
                 has_pct = "percentage" in it and it["percentage"] is not None
                 if has_pct and Decimal(str(it["percentage"])) > Decimal("0"):
                     pct = Decimal(str(it["percentage"]))
+                    row_weight = (pct * self._target_weight) / Decimal("100")
                 else:
                     pct = (w / total_weight) * Decimal("100")
+                    row_weight = (
+                        w
+                        if self._target_weight == total_weight
+                        else (pct * self._target_weight) / Decimal("100")
+                    )
                 cost = Decimal(str(it.get("cost_per_unit", "0.00")))
                 self._ingredients.append(
                     {
                         "name": str(it["name"]).strip(),
                         "percentage": pct,
                         "cost_per_unit": cost,
-                        "weight": w,
+                        "weight": row_weight,
                         "original_order": idx,
                     }
                 )
@@ -578,8 +641,9 @@ class RecipeTableModel(QAbstractTableModel):
     def set_target_weight(self, weight: Decimal) -> None:
         if weight != self._target_weight and weight > Decimal("0"):
             self._target_weight = weight
-            for item in self._ingredients:
-                item["weight"] = (item["percentage"] * self._target_weight) / Decimal("100")
+            with decimal.localcontext(CALCULATION_CONTEXT):
+                for item in self._ingredients:
+                    item["weight"] = (item["percentage"] * self._target_weight) / Decimal("100")
             self.recalculate()
 
     def set_precision(self, precision: Decimal) -> None:
@@ -598,11 +662,12 @@ class RecipeTableModel(QAbstractTableModel):
         next_order = self._next_original_order
         self._next_original_order += 1
         if weight is None:
-            weight = (
-                (percentage * self._target_weight) / Decimal("100")
-                if percentage > Decimal("0")
-                else Decimal("0.00")
-            )
+            with decimal.localcontext(CALCULATION_CONTEXT):
+                weight = (
+                    (percentage * self._target_weight) / Decimal("100")
+                    if percentage > Decimal("0")
+                    else Decimal("0.00")
+                )
         self.beginInsertRows(QModelIndex(), row_pos, row_pos)
         self._ingredients.append(
             {
@@ -657,6 +722,8 @@ class RecipeTableModel(QAbstractTableModel):
 
         try:
             recipe = self.get_recipe()
+            if recipe is None:
+                return
             batch = compute_batch(recipe, target_weight=self._target_weight, precision=self._precision)
             self._current_batch = batch
             self._is_valid = True

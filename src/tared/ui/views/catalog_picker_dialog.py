@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QItemSelectionModel, Qt
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+from tared.core.formatting import format_currency
 from tared.core.models import CatalogIngredient
 from tared.storage.base import RecipeRepository
 
@@ -48,9 +49,12 @@ class CatalogPickerDialog(QDialog):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.verticalHeader().setVisible(False)
+        v_header = self.table.verticalHeader()
+        if v_header is not None:
+            v_header.setVisible(False)
 
         header = self.table.horizontalHeader()
+        assert header is not None
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
@@ -77,7 +81,7 @@ class CatalogPickerDialog(QDialog):
             name_item = QTableWidgetItem(item.name)
             name_item.setData(Qt.ItemDataRole.UserRole, item)
 
-            cost_item = QTableWidgetItem(f"${item.cost_per_unit:.2f}/kg")
+            cost_item = QTableWidgetItem(f"{format_currency(item.cost_per_unit)}/kg")
             cost_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
             supp_item = QTableWidgetItem(item.supplier)
@@ -88,20 +92,44 @@ class CatalogPickerDialog(QDialog):
 
     def _filter(self, text: str) -> None:
         query = text.lower().strip()
+        sel_model = self.table.selectionModel()
+        tbl_model = self.table.model()
         for row in range(self.table.rowCount()):
             name_cell = self.table.item(row, 0)
             supp_cell = self.table.item(row, 2)
             name = name_cell.text().lower() if name_cell else ""
             supp = supp_cell.text().lower() if supp_cell else ""
-            self.table.setRowHidden(row, query not in name and query not in supp)
+            hidden = query not in name and query not in supp
+            self.table.setRowHidden(row, hidden)
+            if (
+                hidden
+                and sel_model is not None
+                and tbl_model is not None
+                and sel_model.isRowSelected(row, self.table.rootIndex())
+            ):
+                sel_model.select(
+                    tbl_model.index(row, 0),
+                    QItemSelectionModel.SelectionFlag.Deselect | QItemSelectionModel.SelectionFlag.Rows,
+                )
+        self._on_selection_changed()
 
     def _on_selection_changed(self) -> None:
-        self.btn_insert.setEnabled(len(self.table.selectionModel().selectedRows()) > 0)
+        sel_model = self.table.selectionModel()
+        if sel_model is None:
+            self.btn_insert.setEnabled(False)
+            return
+        visible_selected = [idx for idx in sel_model.selectedRows() if not self.table.isRowHidden(idx.row())]
+        self.btn_insert.setEnabled(len(visible_selected) > 0)
 
     def accept(self) -> None:
         self.selected_items = []
-        for idx in self.table.selectionModel().selectedRows():
-            item_data = self.table.item(idx.row(), 0).data(Qt.ItemDataRole.UserRole)
-            if item_data is not None:
-                self.selected_items.append(item_data)
+        sel_model = self.table.selectionModel()
+        if sel_model is not None:
+            for idx in sel_model.selectedRows():
+                if self.table.isRowHidden(idx.row()):
+                    continue
+                cell = self.table.item(idx.row(), 0)
+                item_data = cell.data(Qt.ItemDataRole.UserRole) if cell is not None else None
+                if item_data is not None:
+                    self.selected_items.append(item_data)
         super().accept()

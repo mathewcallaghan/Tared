@@ -3,6 +3,7 @@
 import unittest
 from decimal import Decimal
 
+from tared.core.calculator import PercentageSumError
 from tared.core.models import CatalogIngredient, Ingredient, Recipe
 from tared.core.service import RecipeService, summarize_revision_diff
 from tared.storage.sqlite_repo import SQLiteRecipeRepository
@@ -392,6 +393,144 @@ class TestRecipeService(unittest.TestCase):
         self.assertEqual(reverted.version, 1)
         self.assertFalse(reverted.is_draft)
         self.assertEqual(reverted.description, "Updated mixing")
+
+    def test_save_non_draft_incomplete_percentages_raises_error(self) -> None:
+        incomplete = Recipe(
+            id="rec-incomplete-final",
+            name="Incomplete Final",
+            is_draft=False,
+            ingredients=(
+                Ingredient("Water", Decimal("50.00")),
+                Ingredient("Sugar", Decimal("30.00")),
+            ),
+        )
+        with self.assertRaises(PercentageSumError):
+            self.service.save_recipe(incomplete)
+
+    def test_import_non_draft_incomplete_percentages_raises_error(self) -> None:
+        incomplete = Recipe(
+            id="rec-import-incomplete",
+            name="Invalid Imported Final",
+            is_draft=False,
+            ingredients=(
+                Ingredient("Water", Decimal("50.00")),
+                Ingredient("Sugar", Decimal("30.00")),
+            ),
+        )
+        with self.assertRaises(PercentageSumError):
+            self.service.import_recipe(incomplete)
+        self.assertIsNone(self.repo.get_recipe("rec-import-incomplete"))
+
+    def test_import_draft_incomplete_percentages_succeeds(self) -> None:
+        draft_import = Recipe(
+            id="rec-import-draft",
+            name="Valid Imported Draft",
+            is_draft=True,
+            ingredients=(
+                Ingredient("Water", Decimal("60.00")),
+                Ingredient("Sugar", Decimal("20.00")),
+            ),
+        )
+        imported = self.service.import_recipe(draft_import)
+        self.assertTrue(imported.is_draft)
+        self.assertEqual(imported.version, 1)
+        self.assertEqual(len(self.repo.get_recipe_revisions("rec-import-draft")), 0)
+
+
+    def test_import_recipe_detects_archived_corrupted_recipe_collision(self) -> None:
+        conn = self.repo._get_connection()
+        conn.execute(
+            "INSERT INTO recipes (id, name, version, updated_at, is_archived) "
+            "VALUES ('corrupt-arch-imp', 'Corrupt Archived Formula', 1, '', 1);"
+        )
+
+        incoming = Recipe(
+            id="corrupt-arch-imp",
+            name="Restored Replacement",
+            version=1,
+            ingredients=(Ingredient("Water", Decimal("100.00")),),
+        )
+        imported = self.service.import_recipe(incoming, collision_mode="overwrite")
+        self.assertEqual(imported.id, "corrupt-arch-imp")
+        self.assertEqual(imported.name, "Restored Replacement")
+
+    def test_summarize_revision_diff_reports_casing_only_ingredient_rename(self) -> None:
+        r_v1 = Recipe(
+            id="rec-case-rename",
+            name="Case Test",
+            ingredients=(Ingredient("water", Decimal("100.00"), Decimal("0.10")),),
+        )
+        self.service.save_recipe(r_v1)
+        r_v2 = Recipe(
+            id="rec-case-rename",
+            name="Case Test",
+            ingredients=(Ingredient("Water", Decimal("100.00"), Decimal("0.10")),),
+        )
+        saved_v2 = self.service.save_recipe(r_v2)
+        self.assertEqual(saved_v2.version, 2)
+
+        revs = self.repo.get_recipe_revisions("rec-case-rename")
+        diff = summarize_revision_diff(revs[1], revs[0])
+        self.assertIn("Renamed 'water' → 'Water'", diff)
+
+    def test_ingredient_strips_whitespace_and_avoids_spurious_diff(self) -> None:
+        from tared.core.service import has_formulation_changed
+
+        padded = Ingredient(name="  Water  ", percentage=Decimal("100.00"), cost_per_unit=Decimal("0.10"))
+        self.assertEqual(padded.name, "Water")
+
+        r1 = Recipe(id="rec-ws-1", name="Base", ingredients=(padded,))
+        r2 = Recipe(
+            id="rec-ws-1",
+            name="Base",
+            ingredients=(Ingredient(name="Water", percentage=Decimal("100.00"), cost_per_unit=Decimal("0.10")),),
+        )
+        self.assertFalse(has_formulation_changed(r1, r2))
+
+    def test_recipe_strips_name_and_id_and_handles_corrupt_revision_or_null_diff_cost(self) -> None:
+        padded = Recipe(
+            id="  rec-padded-01  ",
+            name="  Padded Formula  ",
+            ingredients=(Ingredient("Water", Decimal("100.00"), Decimal("0.10")),),
+        )
+        self.assertEqual(padded.id, "rec-padded-01")
+        self.assertEqual(padded.name, "Padded Formula")
+
+        self.service.save_recipe(self.initial_recipe)
+        with self.repo._get_connection() as conn:
+            conn.execute("DROP TRIGGER IF EXISTS prevent_revision_update;")
+            conn.execute(
+                "UPDATE recipe_revisions SET ingredients_json = ? WHERE recipe_id = ?;",
+                ('[{"name": "Sugar", "percentage": "bad", "cost_per_unit": "1.00"}]', self.initial_recipe.id),
+            )
+        reloaded = self.repo.get_recipe(self.initial_recipe.id)
+        assert reloaded is not None
+        self.assertEqual(self.service.compute_next_version(reloaded), 1)
+
+        prev_json = '[{"name": "Water", "percentage": "100.00", "cost_per_unit": null}]'
+        curr_json = (
+            '[{"name": "Water", "percentage": "90.00", "cost_per_unit": null}, '
+            '{"name": "Salt", "percentage": "10.00", "cost_per_unit": null}]'
+        )
+        diff_summary = summarize_revision_diff(
+            {"name": "F", "description": "", "ingredients_json": prev_json},
+            {"name": "F", "description": "", "ingredients_json": curr_json},
+        )
+        self.assertIn("Water: 100.00% → 90.00%", diff_summary)
+        self.assertIn("Added Salt (10.00%)", diff_summary)
+
+    def test_discard_draft_rejects_archived_draft(self) -> None:
+        archived_draft = Recipe(
+            id="rec-arch-draft",
+            name="Archived Draft",
+            version=1,
+            is_draft=True,
+            ingredients=(Ingredient("Water", Decimal("50.00")),),
+        )
+        self.service.save_recipe(archived_draft)
+        self.repo.delete_recipe("rec-arch-draft")
+        with self.assertRaises(ValueError):
+            self.service.discard_draft("rec-arch-draft")
 
 
 if __name__ == "__main__":

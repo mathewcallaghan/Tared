@@ -9,7 +9,9 @@ import os
 import platform
 import re
 import sys
+import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -29,9 +31,9 @@ ALLOWED_UPDATE_HOSTS = (
     "raw.githubusercontent.com",
 )
 
-# Canonical repository public key for update verification (Ed25519 raw 32 bytes hex)
-# Overridable via TARED_UPDATER_PUBLIC_KEY for custom forks or staging distributions
-DEFAULT_UPDATER_PUBKEY_HEX = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+# Canonical repository public key for update verification (Ed25519 raw 32 bytes hex).
+# Empty until a production signing key is provisioned; overridable via TARED_UPDATER_PUBLIC_KEY.
+DEFAULT_UPDATER_PUBKEY_HEX = ""
 
 # --- RFC 8032 Pure-Python Ed25519 Signature Verification ---
 _ED25519_P = 2**255 - 19
@@ -139,12 +141,14 @@ def parse_minisig_or_raw_signature(sig_text_or_bytes: str | bytes) -> bytes | No
         if line.startswith("untrusted comment") or line.startswith("trusted comment"):
             continue
         try:
-            raw = base64.b64decode(line)
+            raw = base64.b64decode(line, validate=True)
+            if len(raw) == 74:
+                if raw[:2] == b"Ed":
+                    return raw[10:74]
+                return None
             if len(raw) == 64:
                 return raw
-            if len(raw) == 74 and raw[:2] == b"Ed":
-                return raw[10:74]
-        except Exception:
+        except ValueError:
             continue
     return None
 
@@ -172,6 +176,8 @@ def is_safe_update_url(url: str) -> bool:
         parsed = urlparse(url)
         if parsed.scheme.lower() not in ALLOWED_UPDATE_SCHEMES:
             return False
+        if parsed.username is not None or parsed.password is not None:
+            return False
         host = (parsed.hostname or "").lower()
         if not host:
             return False
@@ -182,19 +188,66 @@ def is_safe_update_url(url: str) -> bool:
         return False
 
 
-def parse_version(version_str: str) -> tuple[int, int, int, int, int]:
-    """Parse a semantic version string into a comparable tuple: (major, minor, patch, is_release, pre_num)."""
-    clean = version_str.strip().lstrip("vV")
-    prerelease_match = re.search(r"[-+]([a-zA-Z]*)[.]?(\d+)?", clean)
-    is_release = 1
-    pre_num = 0
-    if prerelease_match:
-        is_release = 0
-        num_str = prerelease_match.group(2)
-        pre_num = int(num_str) if num_str else 0
-        clean = clean[: prerelease_match.start()]
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject HTTP redirects targeting untrusted schemes or hosts prior to connection."""
 
-    numbers = []
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        if not is_safe_update_url(newurl):
+            raise urllib.error.URLError(f"Untrusted redirect destination rejected: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_STDLIB_URLOPEN = urllib.request.urlopen
+_SAFE_OPENER = urllib.request.build_opener(_SafeRedirectHandler())
+
+
+def open_safe_update_url(req: urllib.request.Request, timeout: int = 8) -> Any:
+    """Open an update URL while enforcing origin safety on the initial request and all redirects."""
+    if not is_safe_update_url(req.full_url):
+        raise urllib.error.URLError(f"Untrusted update URL rejected: {req.full_url}")
+    if urllib.request.urlopen is not _STDLIB_URLOPEN:
+        return urllib.request.urlopen(req, timeout=timeout)
+    return _SAFE_OPENER.open(req, timeout=timeout)
+
+
+def _parse_prerelease_identifiers(pre_str: str) -> tuple[tuple[int, int | str], ...]:
+    """Parse dot-separated SemVer prerelease identifiers into comparable tuples."""
+    if not pre_str:
+        return ()
+    parts: list[tuple[int, int | str]] = []
+    segments = [s for s in re.split(r"[.-]", pre_str) if s]
+    for segment in segments:
+        tokens = re.findall(r"[a-zA-Z]+|\d+", segment)
+        for tok in tokens:
+            if tok.isdigit():
+                parts.append((0, int(tok)))
+            else:
+                parts.append((1, tok.lower()))
+    return tuple(parts)
+
+
+def _parse_semver_key(version_str: str) -> tuple[int, int, int, int, tuple[tuple[int, int | str], ...]]:
+    """Parse a semantic version string into (major, minor, patch, is_release, pre_identifiers)."""
+    clean = version_str.strip().lstrip("vV")
+    if "+" in clean:
+        clean = clean.split("+", 1)[0]
+
+    is_release = 1
+    pre_identifiers: tuple[tuple[int, int | str], ...] = ()
+    if "-" in clean:
+        clean, pre_str = clean.split("-", 1)
+        is_release = 0
+        pre_identifiers = _parse_prerelease_identifiers(pre_str)
+
+    numbers: list[int] = []
     for segment in clean.split("."):
         try:
             numbers.append(int(segment))
@@ -205,12 +258,24 @@ def parse_version(version_str: str) -> tuple[int, int, int, int, int]:
         numbers.append(0)
     numbers = numbers[:3]
 
-    return (numbers[0], numbers[1], numbers[2], is_release, pre_num)
+    return (numbers[0], numbers[1], numbers[2], is_release, pre_identifiers)
+
+
+def parse_version(version_str: str) -> tuple[int, int, int, int, int]:
+    """Parse a semantic version string into a comparable tuple: (major, minor, patch, is_release, pre_num)."""
+    key = _parse_semver_key(version_str)
+    pre_num = 0
+    if key[4]:
+        for tag_type, val in key[4]:
+            if tag_type == 0 and isinstance(val, int):
+                pre_num = val
+                break
+    return (key[0], key[1], key[2], key[3], pre_num)
 
 
 def is_newer_version(current_ver: str, candidate_ver: str) -> bool:
     """Return True if candidate_ver is strictly newer than current_ver."""
-    return parse_version(candidate_ver) > parse_version(current_ver)
+    return _parse_semver_key(candidate_ver) > _parse_semver_key(current_ver)
 
 
 def get_current_appimage_path() -> Path | None:
@@ -245,9 +310,11 @@ def find_compatible_asset(
         re.IGNORECASE,
     )
 
-    for asset in assets:
-        name = asset.get("name", "")
-        if strict_pattern.match(name):
+    for asset in assets or []:
+        if not isinstance(asset, dict):
+            continue
+        name = asset.get("name")
+        if isinstance(name, str) and name and strict_pattern.match(name):
             return asset
 
     return None
@@ -262,17 +329,32 @@ def compute_file_sha256(file_path: Path) -> str:
     return sha.hexdigest().lower()
 
 
-def _fetch_asset_bytes(url: str, timeout: int = 6) -> bytes | None:
+def _fetch_asset_bytes(
+    url: str,
+    timeout: int = 6,
+    cancel_check: Callable[[], bool] | None = None,
+    on_response: Callable[[Any], None] | None = None,
+) -> bytes | None:
     """Safely fetch companion asset text/bytes over verified HTTPS."""
+    if cancel_check is not None and cancel_check():
+        return None
     if not is_safe_update_url(url):
         return None
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Tared-Updater"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            resp_url = getattr(resp, "geturl", lambda: None)()
-            if isinstance(resp_url, str) and not is_safe_update_url(resp_url):
-                return None
-            return resp.read(256 * 1024)
+        with open_safe_update_url(req, timeout=timeout) as resp:
+            if on_response is not None:
+                on_response(resp)
+            try:
+                if cancel_check is not None and cancel_check():
+                    return None
+                resp_url = getattr(resp, "geturl", lambda: None)()
+                if isinstance(resp_url, str) and not is_safe_update_url(resp_url):
+                    return None
+                return resp.read(256 * 1024)
+            finally:
+                if on_response is not None:
+                    on_response(None)
     except Exception:
         return None
 
@@ -283,49 +365,77 @@ def find_expected_sha256_and_signature(
     release_body: str = "",
     pubkey_hex: str | None = None,
     timeout: int = 6,
+    cancel_check: Callable[[], bool] | None = None,
+    on_response: Callable[[Any], None] | None = None,
 ) -> tuple[str, bool]:
     """Resolve expected SHA-256 and verify detached Ed25519 signature of the release manifest."""
-    resolved_pubkey = pubkey_hex or os.environ.get("TARED_UPDATER_PUBLIC_KEY") or DEFAULT_UPDATER_PUBKEY_HEX
+    resolved_pubkey = (
+        (os.environ.get("TARED_UPDATER_PUBLIC_KEY") or DEFAULT_UPDATER_PUBKEY_HEX)
+        if pubkey_hex is None
+        else pubkey_hex
+    )
     expected_hash = ""
+    hash_from_manifest = False
     manifest_bytes: bytes | None = None
 
-    sha_asset_names = {
-        f"{target_asset_name}.sha256",
-        f"{target_asset_name}.sha256.txt",
-        "SHA256SUMS",
-        "SHA256SUMS.txt",
-        "checksums.txt",
-    }
-    sig_asset_names = {
-        f"{target_asset_name}.minisig",
-        f"{target_asset_name}.sig",
-        "SHA256SUMS.minisig",
-        "SHA256SUMS.sig",
-        "checksums.txt.sig",
-    }
+    manifest_pairs = [
+        (
+            (f"{target_asset_name}.sha256", f"{target_asset_name}.sha256.txt"),
+            (f"{target_asset_name}.minisig", f"{target_asset_name}.sig"),
+        ),
+        (
+            ("SHA256SUMS", "SHA256SUMS.txt", "checksums.txt"),
+            ("SHA256SUMS.minisig", "SHA256SUMS.sig", "checksums.txt.sig", "checksums.txt.minisig"),
+        ),
+    ]
 
+    assets_by_name = {asset.get("name", ""): asset for asset in assets if asset.get("name")}
     manifest_asset = None
     sig_asset = None
 
-    for asset in assets:
-        name = asset.get("name", "")
-        if name in sha_asset_names and manifest_asset is None:
-            manifest_asset = asset
-        if name in sig_asset_names and sig_asset is None:
-            sig_asset = asset
+    # First pass: look for a manifest that has a matching signed companion
+    for m_names, s_names in manifest_pairs:
+        found_m = next((assets_by_name[n] for n in m_names if n in assets_by_name), None)
+        found_s = next((assets_by_name[n] for n in s_names if n in assets_by_name), None)
+        if found_m and found_s:
+            manifest_asset = found_m
+            sig_asset = found_s
+            break
+
+    # Second pass: fall back to unsigned manifest if no signed pair exists
+    if manifest_asset is None:
+        for m_names, _ in manifest_pairs:
+            found_m = next((assets_by_name[n] for n in m_names if n in assets_by_name), None)
+            if found_m:
+                manifest_asset = found_m
+                break
+
+    fetch_kwargs: dict[str, Any] = {"timeout": timeout}
+    if cancel_check is not None:
+        fetch_kwargs["cancel_check"] = cancel_check
+    if on_response is not None:
+        fetch_kwargs["on_response"] = on_response
 
     if manifest_asset:
-        dl_url = manifest_asset.get("browser_download_url", "")
-        manifest_bytes = _fetch_asset_bytes(dl_url, timeout=timeout)
+        if cancel_check is not None and cancel_check():
+            return "", False
+        raw_dl_url = manifest_asset.get("browser_download_url")
+        dl_url = raw_dl_url if isinstance(raw_dl_url, str) else ""
+        manifest_bytes = _fetch_asset_bytes(dl_url, **fetch_kwargs)
         if manifest_bytes:
             text = manifest_bytes.decode("utf-8", errors="replace")
             for line in text.splitlines():
-                parts = line.strip().split()
+                parts = line.strip().split(None, 1)
                 if len(parts) >= 2:
                     h_cand = parts[0].strip().lower()
-                    f_cand = Path(parts[1].lstrip("*")).name.strip()
-                    if f_cand.lower() == target_asset_name.lower() and len(h_cand) == 64:
+                    f_cand = Path(parts[1].lstrip("*").strip()).name.strip()
+                    if (
+                        f_cand.lower() == target_asset_name.lower()
+                        and len(h_cand) == 64
+                        and all(c in "0123456789abcdef" for c in h_cand)
+                    ):
                         expected_hash = h_cand
+                        hash_from_manifest = True
                         break
 
     if not expected_hash and release_body:
@@ -341,9 +451,12 @@ def find_expected_sha256_and_signature(
                 expected_hash = digest.lower()
 
     is_verified = False
-    if sig_asset and manifest_bytes and resolved_pubkey:
-        sig_url = sig_asset.get("browser_download_url", "")
-        raw_sig = _fetch_asset_bytes(sig_url, timeout=timeout)
+    if sig_asset and manifest_bytes and hash_from_manifest and resolved_pubkey:
+        if cancel_check is not None and cancel_check():
+            return expected_hash, False
+        raw_sig_url = sig_asset.get("browser_download_url")
+        sig_url = raw_sig_url if isinstance(raw_sig_url, str) else ""
+        raw_sig = _fetch_asset_bytes(sig_url, **fetch_kwargs)
         if raw_sig:
             parsed_sig = parse_minisig_or_raw_signature(raw_sig)
             if parsed_sig:
@@ -372,8 +485,12 @@ def fetch_latest_release_info(
     api_url: str = LATEST_RELEASE_API_URL,
     pubkey_hex: str | None = None,
     timeout: int = 8,
+    cancel_check: Callable[[], bool] | None = None,
+    on_response: Callable[[Any], None] | None = None,
 ) -> tuple[bool, UpdateInfo | None, str]:
     """Query GitHub releases endpoint and verify available update against authenticity model."""
+    if cancel_check is not None and cancel_check():
+        return False, None, "Update check cancelled."
     if not is_safe_update_url(api_url):
         return False, None, f"Untrusted update API URL rejected: {api_url}"
 
@@ -386,17 +503,32 @@ def fetch_latest_release_info(
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
-            resp_url = getattr(response, "geturl", lambda: None)()
-            if isinstance(resp_url, str) and not is_safe_update_url(resp_url):
-                return False, None, f"Untrusted redirect destination rejected: {resp_url}"
-            if response.status != 200:
-                return False, None, f"GitHub API responded with HTTP status {response.status}"
-            payload = json.loads(response.read(1024 * 1024).decode("utf-8"))
+        with open_safe_update_url(req, timeout=timeout) as response:
+            if on_response is not None:
+                on_response(response)
+            try:
+                if cancel_check is not None and cancel_check():
+                    return False, None, "Update check cancelled."
+                resp_url = getattr(response, "geturl", lambda: None)()
+                if isinstance(resp_url, str) and not is_safe_update_url(resp_url):
+                    return False, None, f"Untrusted redirect destination rejected: {resp_url}"
+                if response.status != 200:
+                    return False, None, f"GitHub API responded with HTTP status {response.status}"
+                payload = json.loads(response.read(1024 * 1024).decode("utf-8"))
+            finally:
+                if on_response is not None:
+                    on_response(None)
     except Exception as err:
         return False, None, f"Network check failed: {err}"
 
-    tag_name = str(payload.get("tag_name", "")).strip()
+    if cancel_check is not None and cancel_check():
+        return False, None, "Update check cancelled."
+
+    if not isinstance(payload, dict):
+        return False, None, "Latest release metadata is not a JSON object."
+
+    raw_tag = payload.get("tag_name")
+    tag_name = raw_tag.strip() if isinstance(raw_tag, str) else ""
     remote_version = tag_name.lstrip("vV")
     if not remote_version:
         return False, None, "Latest release on GitHub contains an empty version tag."
@@ -404,23 +536,45 @@ def fetch_latest_release_info(
     if not is_newer_version(current_version, remote_version):
         return False, None, f"Tared is up to date (current: v{current_version}, latest: {tag_name})."
 
-    assets = payload.get("assets", [])
+    raw_assets = payload.get("assets")
+    if raw_assets is None:
+        assets: list[dict[str, Any]] = []
+    elif not isinstance(raw_assets, list):
+        return False, None, "Latest release metadata contains malformed assets list."
+    else:
+        assets = [asset for asset in raw_assets if isinstance(asset, dict)]
     matched_asset = find_compatible_asset(assets, remote_version)
 
-    download_url = matched_asset.get("browser_download_url", "") if matched_asset else ""
+    raw_dl_url = matched_asset.get("browser_download_url") if matched_asset else ""
+    download_url = raw_dl_url if isinstance(raw_dl_url, str) else ""
     if download_url and not is_safe_update_url(download_url):
         return False, None, f"Release asset URL failed security origin verification: {download_url}"
 
-    asset_name = matched_asset.get("name", "") if matched_asset else ""
-    asset_size = int(matched_asset.get("size", 0)) if matched_asset else 0
+    raw_asset_name = matched_asset.get("name") if matched_asset else ""
+    asset_name = raw_asset_name if isinstance(raw_asset_name, str) else ""
+    raw_asset_size = matched_asset.get("size") if matched_asset else 0
+    if isinstance(raw_asset_size, bool) or raw_asset_size is None:
+        asset_size = 0
+    else:
+        try:
+            asset_size = max(0, int(raw_asset_size))
+        except (TypeError, ValueError):
+            asset_size = 0
 
     release_body = str(payload.get("body", "") or "No release notes provided.")
-    expected_sha256, is_verified = find_expected_sha256_and_signature(
-        assets,
-        asset_name,
-        release_body=release_body,
-        pubkey_hex=pubkey_hex,
-    ) if asset_name else ("", False)
+    sha_kwargs: dict[str, Any] = {
+        "release_body": release_body,
+        "pubkey_hex": pubkey_hex,
+    }
+    if cancel_check is not None:
+        sha_kwargs["cancel_check"] = cancel_check
+    if on_response is not None:
+        sha_kwargs["on_response"] = on_response
+    expected_sha256, is_verified = (
+        find_expected_sha256_and_signature(assets, asset_name, **sha_kwargs)
+        if asset_name
+        else ("", False)
+    )
 
     info = UpdateInfo(
         version=remote_version,
@@ -429,7 +583,7 @@ def fetch_latest_release_info(
         download_url=download_url,
         asset_name=asset_name,
         asset_size=asset_size,
-        published_at=str(payload.get("published_at", "")),
+        published_at=pub_at if isinstance((pub_at := payload.get("published_at")), str) else "",
         expected_sha256=expected_sha256,
         is_signature_verified=is_verified,
     )
@@ -471,7 +625,15 @@ def apply_appimage_update(
 
     dest_path = target_appimage
     if new_asset_name and re.search(r"[-_]v?\d+\.\d+", target_appimage.name):
-        dest_path = target_appimage.parent / new_asset_name
+        safe_asset_name = Path(new_asset_name).name
+        if (
+            not safe_asset_name
+            or safe_asset_name != new_asset_name
+            or safe_asset_name in (".", "..")
+            or "\\" in new_asset_name
+        ):
+            raise ValueError(f"Unsafe update asset filename rejected: {new_asset_name!r}")
+        dest_path = target_appimage.parent / safe_asset_name
 
     os.replace(str(staged_binary), str(dest_path))
 
@@ -485,7 +647,24 @@ def apply_appimage_update(
 
 
 def restart_appimage(appimage_path: Path) -> None:
-    """Execute updated AppImage file in place of the current process."""
+    """Execute updated AppImage file in place of the current process, cleaning stale library paths."""
     appimage_path.chmod(appimage_path.stat().st_mode | 0o755)
+
+    orig_ld = os.environ.get("TARED_ORIG_LD_LIBRARY_PATH")
+    if orig_ld is not None:
+        if orig_ld:
+            os.environ["LD_LIBRARY_PATH"] = orig_ld
+        else:
+            os.environ.pop("LD_LIBRARY_PATH", None)
+    else:
+        appdir = os.environ.get("APPDIR", "")
+        current_ld = os.environ.get("LD_LIBRARY_PATH", "")
+        if current_ld and appdir:
+            cleaned_parts = [p for p in current_ld.split(":") if p and not p.startswith(appdir)]
+            if cleaned_parts:
+                os.environ["LD_LIBRARY_PATH"] = ":".join(cleaned_parts)
+            else:
+                os.environ.pop("LD_LIBRARY_PATH", None)
+
     args = [str(appimage_path)] + sys.argv[1:]
     os.execv(str(appimage_path), args)

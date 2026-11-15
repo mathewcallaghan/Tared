@@ -51,14 +51,17 @@ def _resolve_currency_quantum(currency_precision: Decimal | str | int | None) ->
     """Resolve currency precision into a discrete step increment."""
     if currency_precision is None:
         return None
-    if isinstance(currency_precision, float):
-        raise TypeError("Floating-point currency precision is disallowed; use Decimal, str, or int.")
+    if isinstance(currency_precision, (float, bool)):
+        raise TypeError("Floating-point or boolean currency precision is disallowed; use Decimal, str, or int.")
     if isinstance(currency_precision, int):
         if currency_precision < 0:
             raise ValueError(f"Integer currency decimal places must be non-negative, got {currency_precision}")
         return Decimal("10") ** -currency_precision
 
-    quantum = Decimal(str(currency_precision))
+    try:
+        quantum = Decimal(str(currency_precision))
+    except decimal.InvalidOperation as err:
+        raise ValueError(f"Currency precision must be a positive finite number, got {currency_precision}") from err
     if not quantum.is_finite() or quantum <= Decimal("0"):
         raise ValueError(f"Currency precision must be a positive finite number, got {currency_precision}")
     return quantum
@@ -88,22 +91,28 @@ def compute_batch(
     1. Higher ingredient formula percentage
     2. Earlier compounding position in the recipe sequence (lower index)
     """
-    if isinstance(target_weight, float):
+    if isinstance(target_weight, (float, bool)):
         raise TypeError(
-            f"Binary floating-point target_weight ({target_weight}) is disallowed to prevent precision loss. "
+            f"Floating-point or boolean target_weight ({target_weight}) is disallowed to prevent precision loss. "
             "Pass Decimal, str, or int instead."
         )
-    if isinstance(precision, float):
+    if isinstance(precision, (float, bool)):
         raise TypeError(
-            f"Binary floating-point precision ({precision}) is disallowed to prevent precision loss. "
+            f"Floating-point or boolean precision ({precision}) is disallowed to prevent precision loss. "
             "Pass Decimal, str, or int instead."
         )
 
     with decimal.localcontext(CALCULATION_CONTEXT):
-        if not isinstance(target_weight, Decimal):
-            target_weight = Decimal(str(target_weight))
-        if not isinstance(precision, Decimal):
-            precision = Decimal(str(precision))
+        try:
+            if not isinstance(target_weight, Decimal):
+                target_weight = Decimal(str(target_weight))
+        except decimal.InvalidOperation as err:
+            raise ValueError(f"Target weight must be a finite positive number, got {target_weight}") from err
+        try:
+            if not isinstance(precision, Decimal):
+                precision = Decimal(str(precision))
+        except decimal.InvalidOperation as err:
+            raise ValueError(f"Precision must be a finite positive number, got {precision}") from err
 
         currency_quantum = _resolve_currency_quantum(currency_precision)
 
@@ -214,4 +223,5 @@ def compute_batch(
             zero_weight_ingredients=tuple(zero_weight_ingredients),
             high_deviation_ingredients=tuple(high_deviation_ingredients),
             max_allocation_deviation=max_dev,
+            total_percentage=total_percentage,
         )

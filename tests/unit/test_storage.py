@@ -151,6 +151,18 @@ class TestSQLiteRecipeRepository(unittest.TestCase):
                 total_weight=Decimal("100.00"),
                 total_cost=Decimal("1.00"),
             )
+        # Case variant duplicate must also be rejected by COLLATE NOCASE
+        with self.assertRaises(DuplicateBatchNumberError):
+            self.repo.record_batch(
+                recipe_id=self.recipe.id,
+                recipe_version=1,
+                batch_number="bat-dup-001",
+                operator="Operator 3",
+                target_weight=Decimal("100.00"),
+                total_weight=Decimal("100.00"),
+                total_cost=Decimal("1.00"),
+            )
+        self.assertTrue(self.repo.batch_exists("bat-dup-001"))
 
     def test_batch_exists_query(self) -> None:
         self.assertFalse(self.repo.batch_exists("NON-EXISTENT"))
@@ -527,6 +539,267 @@ class TestSQLiteRecipeRepository(unittest.TestCase):
         with self.assertRaises(StorageError):
             self.repo.delete_draft_recipe(self.recipe.id)
 
+    def test_delete_archived_recipe_enforces_batch_and_active_guards(self) -> None:
+        # 1. Active formula cannot be deleted via delete_archived_recipe
+        self.repo.save_recipe(self.recipe)
+        with self.assertRaises(StorageError):
+            self.repo.delete_archived_recipe(self.recipe.id)
+
+        # 2. Archived finalized formula with multiple revisions and 0 batches CAN be deleted
+        v2 = Recipe(
+            id=self.recipe.id,
+            name="Benchmark v2",
+            version=2,
+            ingredients=self.recipe.ingredients,
+        )
+        self.repo.save_recipe(v2)
+        self.repo.delete_recipe(self.recipe.id)
+        self.assertTrue(self.repo.delete_archived_recipe(self.recipe.id))
+        self.assertIsNone(self.repo.get_recipe(self.recipe.id, include_archived=True))
+        self.assertEqual(len(self.repo.get_recipe_revisions(self.recipe.id)), 0)
+        self.assertFalse(self.repo.delete_archived_recipe(self.recipe.id))
+
+        # 3. Archived formula with recorded batch CANNOT be deleted
+        rec_with_batch = Recipe(
+            id="rec-arch-with-batch",
+            name="Audited Formula",
+            version=1,
+            ingredients=self.recipe.ingredients,
+        )
+        self.repo.save_recipe(rec_with_batch)
+        self.repo.record_batch(
+            recipe_id=rec_with_batch.id,
+            recipe_version=1,
+            batch_number="BAT-KEEP-01",
+            operator="Operator",
+            target_weight="100.00",
+            total_weight="100.00",
+            total_cost="1.00",
+        )
+        self.repo.delete_recipe(rec_with_batch.id)
+
+        with self.assertRaises(StorageError):
+            self.repo.delete_archived_recipe(rec_with_batch.id)
+
+        # Trigger must also abort direct revision deletion when batches exist
+        conn = self.repo._get_connection()
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute("DELETE FROM recipe_revisions WHERE recipe_id = ?;", (rec_with_batch.id,))
+
+    def test_reset_workspace_data_preserves_foreign_keys_in_memory(self) -> None:
+        self.repo.save_recipe(self.recipe)
+        self.repo.reset_workspace_data()
+
+        conn = self.repo._get_connection()
+        fk_enabled = conn.execute("PRAGMA foreign_keys;").fetchone()[0]
+        self.assertEqual(fk_enabled, 1)
+        with self.assertRaises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO ingredients (recipe_id, sort_order, name, percentage, cost_per_unit) "
+                "VALUES ('missing-recipe', 0, 'Water', '100.00', '0.00');"
+            )
+
+    def test_save_catalog_ingredients_handles_unicode_case_variants_without_pk_collision(self) -> None:
+        upper_umlaut = CatalogIngredient(id="unicode-id-1", name="Äpfel", cost_per_unit=Decimal("3.00"))
+        lower_umlaut = CatalogIngredient(id="unicode-id-1", name="äpfel", cost_per_unit=Decimal("3.50"))
+        self.repo.save_catalog_ingredients([upper_umlaut, lower_umlaut])
+
+        catalog = self.repo.list_catalog_ingredients()
+        self.assertEqual(len(catalog), 2)
+        self.assertEqual({c.name for c in catalog}, {"Äpfel", "äpfel"})
+        self.assertEqual(len({c.id for c in catalog}), 2)
+
+    def test_export_workspace_snapshot_leaves_no_open_transaction(self) -> None:
+        self.repo.save_recipe(self.recipe)
+        snap = self.repo.export_workspace_snapshot()
+        self.assertEqual(len(snap["recipes"]), 1)
+        self.assertFalse(self.repo._get_connection().in_transaction)
+
+    def test_restore_workspace_in_memory_rolls_back_and_preserves_fk_on_failure(self) -> None:
+        self.repo.save_recipe(self.recipe)
+        bad_workspace = self.repo.export_workspace_snapshot()
+        bad_workspace["batches"] = [
+            {
+                "id": "bad-batch-1",
+                "recipe_id": self.recipe.id,
+                "recipe_version": 999,
+                "batch_number": "BAT-BROKEN-FK",
+                "operator": "Op",
+                "target_weight": "100.00",
+                "total_weight": "100.00",
+                "total_cost": "1.00",
+                "created_at": "2026-01-01T00:00:00Z",
+            }
+        ]
+        with self.assertRaises(StorageError):
+            self.repo.restore_workspace_data(bad_workspace)
+
+        # Original in-memory data and FK enforcement must survive intact
+        self.assertIsNotNone(self.repo.get_recipe(self.recipe.id))
+        conn = self.repo._get_connection()
+        self.assertEqual(conn.execute("PRAGMA foreign_keys;").fetchone()[0], 1)
+
+
+    def test_get_corrupted_recipes_include_archived_parameter(self) -> None:
+        conn = self.repo._get_connection()
+        conn.execute(
+            "INSERT INTO recipes (id, name, version, updated_at, is_archived) "
+            "VALUES ('corrupt-arch-1', 'Archived Corrupt', 1, '', 1);"
+        )
+
+        active_corrupt = self.repo.get_corrupted_recipes(include_archived=False)
+        self.assertEqual(len(active_corrupt), 0)
+
+        all_corrupt = self.repo.get_corrupted_recipes(include_archived=True)
+        self.assertEqual(len(all_corrupt), 1)
+        self.assertEqual(all_corrupt[0]["id"], "corrupt-arch-1")
+
+    def test_get_catalog_ingredients_map_preserves_unicode_case_variants(self) -> None:
+        c1 = CatalogIngredient(id="c1", name="Äpfel", cost_per_unit=Decimal("2.50"))
+        c2 = CatalogIngredient(id="c2", name="äpfel", cost_per_unit=Decimal("3.50"))
+        self.repo.save_catalog_ingredients([c1, c2])
+
+        cat_map = self.repo.get_catalog_ingredients_map()
+        self.assertEqual(len(cat_map), 2)
+        self.assertIn("äpfel", cat_map)
+        self.assertIn("Äpfel", cat_map)
+
+    def test_v3_database_migrates_to_v4_with_nullable_cost_decimals(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "legacy_v3.db"
+            conn = sqlite3.connect(str(db_path))
+            conn.executescript(
+                """
+                CREATE TABLE recipes (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+                    version INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL DEFAULT '',
+                    is_archived INTEGER NOT NULL DEFAULT 0, is_draft INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE ingredients (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, recipe_id TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL, name TEXT NOT NULL,
+                    percentage TEXT NOT NULL, cost_per_unit TEXT NOT NULL
+                );
+                CREATE TABLE recipe_revisions (
+                    id TEXT PRIMARY KEY, recipe_id TEXT NOT NULL, version INTEGER NOT NULL,
+                    name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+                    ingredients_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                    UNIQUE (recipe_id, version)
+                );
+                CREATE TABLE batches (
+                    id TEXT PRIMARY KEY, recipe_id TEXT NOT NULL, recipe_version INTEGER NOT NULL,
+                    batch_number TEXT NOT NULL UNIQUE, operator TEXT NOT NULL,
+                    precision TEXT NOT NULL DEFAULT '0.01', target_weight TEXT NOT NULL,
+                    total_weight TEXT NOT NULL, total_cost TEXT NOT NULL,
+                    items_json TEXT NOT NULL DEFAULT '[]', notes TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE ingredients_catalog (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    cost_per_unit TEXT NOT NULL DEFAULT '0.00', supplier TEXT NOT NULL DEFAULT '',
+                    sku TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                );
+                PRAGMA user_version = 3;
+                """
+            )
+            conn.close()
+
+            repo = SQLiteRecipeRepository(db_path)
+            try:
+                repo.save_recipe(self.recipe)
+                repo.record_batch(
+                    recipe_id=self.recipe.id,
+                    recipe_version=1,
+                    batch_number="BAT-V4-01",
+                    operator="Op",
+                    target_weight=Decimal("100.00"),
+                    total_weight=Decimal("100.00"),
+                    total_cost=Decimal("1.00"),
+                    cost_decimals=2,
+                )
+                batches = repo.list_batches(self.recipe.id)
+                self.assertEqual(batches[0]["cost_decimals"], 2)
+                c = repo._get_connection()
+                try:
+                    self.assertEqual(c.execute("PRAGMA user_version;").fetchone()[0], 5)
+                    # Verify case-insensitive batch constraint active after migration
+                    with self.assertRaises(DuplicateBatchNumberError):
+                        repo.record_batch(
+                            recipe_id=self.recipe.id,
+                            recipe_version=1,
+                            batch_number="bat-v4-01",
+                            operator="Op2",
+                            target_weight=Decimal("100.00"),
+                            total_weight=Decimal("100.00"),
+                            total_cost=Decimal("1.00"),
+                        )
+                finally:
+                    c.close()
+            finally:
+                repo.close()
+
+    def test_v4_to_v5_migration_raises_clear_storage_error_on_case_colliding_batches(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "legacy_v4_collide.db"
+            conn = sqlite3.connect(str(db_path))
+            conn.executescript(
+                """
+                CREATE TABLE recipes (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+                    version INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL DEFAULT '',
+                    is_archived INTEGER NOT NULL DEFAULT 0, is_draft INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE ingredients (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, recipe_id TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL, name TEXT NOT NULL,
+                    percentage TEXT NOT NULL, cost_per_unit TEXT NOT NULL
+                );
+                CREATE TABLE recipe_revisions (
+                    id TEXT PRIMARY KEY, recipe_id TEXT NOT NULL, version INTEGER NOT NULL,
+                    name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+                    ingredients_json TEXT NOT NULL, created_at TEXT NOT NULL,
+                    UNIQUE (recipe_id, version)
+                );
+                CREATE TABLE batches (
+                    id TEXT PRIMARY KEY, recipe_id TEXT NOT NULL, recipe_version INTEGER NOT NULL,
+                    batch_number TEXT NOT NULL UNIQUE, operator TEXT NOT NULL,
+                    precision TEXT NOT NULL DEFAULT '0.01', target_weight TEXT NOT NULL,
+                    total_weight TEXT NOT NULL, total_cost TEXT NOT NULL,
+                    items_json TEXT NOT NULL DEFAULT '[]', notes TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL, cost_decimals INTEGER
+                );
+                CREATE TABLE ingredients_catalog (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    cost_per_unit TEXT NOT NULL DEFAULT '0.00', supplier TEXT NOT NULL DEFAULT '',
+                    sku TEXT NOT NULL DEFAULT '', notes TEXT NOT NULL DEFAULT '',
+                    updated_at TEXT NOT NULL DEFAULT ''
+                );
+                INSERT INTO recipes (id, name, version) VALUES ('r1', 'R1', 1);
+                INSERT INTO recipe_revisions (id, recipe_id, version, name, ingredients_json, created_at)
+                    VALUES ('rv1', 'r1', 1, 'R1', '[]', '2026-01-01T00:00:00Z');
+                INSERT INTO batches (id, recipe_id, recipe_version, batch_number, operator,
+                    target_weight, total_weight, total_cost, created_at)
+                    VALUES ('b1', 'r1', 1, 'BAT-DUP', 'Op', '100', '100', '1', '2026-01-01T00:00:00Z');
+                INSERT INTO batches (id, recipe_id, recipe_version, batch_number, operator,
+                    target_weight, total_weight, total_cost, created_at)
+                    VALUES ('b2', 'r1', 1, 'bat-dup', 'Op', '100', '100', '1', '2026-01-01T00:00:01Z');
+                PRAGMA user_version = 4;
+                """
+            )
+            conn.close()
+
+            with self.assertRaises(StorageError) as ctx:
+                SQLiteRecipeRepository(db_path)
+            self.assertIn("case-colliding", str(ctx.exception))
+            self.assertIn("BAT-DUP", str(ctx.exception))
+
 
 class TestJSONRepository(unittest.TestCase):
     def setUp(self) -> None:
@@ -566,6 +839,64 @@ class TestJSONRepository(unittest.TestCase):
         self.assertTrue(len(r1.id) > 0)
         self.assertTrue(len(r2.id) > 0)
         self.assertNotEqual(r1.id, r2.id)
+
+    def test_import_json_parses_is_draft_string_booleans_safely(self) -> None:
+        raw_false = '{"name": "Non Draft", "is_draft": "false", "ingredients": [{"name": "A", "percentage": "100.00"}]}'
+        self.assertFalse(import_recipe_from_json(raw_false).is_draft)
+
+        raw_true = '{"name": "Draft", "is_draft": "true", "ingredients": [{"name": "A", "percentage": "50.00"}]}'
+        self.assertTrue(import_recipe_from_json(raw_true).is_draft)
+
+        raw_bad = '{"name": "Bad", "is_draft": "maybe", "ingredients": [{"name": "A", "percentage": "100.00"}]}'
+        with self.assertRaises(ValueError):
+            import_recipe_from_json(raw_bad)
+
+    def test_import_json_rejects_null_names_and_handles_null_recipe_version(self) -> None:
+        null_recipe_name = '{"name": null, "ingredients": [{"name": "A", "percentage": "100.00"}]}'
+        with self.assertRaises(ValueError):
+            import_recipe_from_json(null_recipe_name)
+
+        null_ing_name = '{"name": "Valid", "ingredients": [{"name": null, "percentage": "100.00"}]}'
+        with self.assertRaises(ValueError):
+            import_recipe_from_json(null_ing_name)
+
+        null_ver = (
+            '{"name": "Null Version", "recipe_version": null, '
+            '"ingredients": [{"name": "A", "percentage": "100.00", "cost_per_unit": null}]}'
+        )
+        rec = import_recipe_from_json(null_ver)
+        self.assertEqual(rec.version, 1)
+        self.assertEqual(rec.ingredients[0].cost_per_unit, Decimal("0.00"))
+
+    def test_sqlite_path_with_hash_character_opens_without_uri_error(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hashed_dir = Path(tmpdir) / "dir#1"
+            hashed_dir.mkdir()
+            db_file = hashed_dir / "recipes.db"
+            disk_repo = SQLiteRecipeRepository(db_file)
+            try:
+                disk_repo.save_recipe(self.recipe)
+                loaded = disk_repo.get_recipe(self.recipe.id)
+                self.assertIsNotNone(loaded)
+                assert loaded is not None
+                self.assertEqual(loaded.name, self.recipe.name)
+            finally:
+                disk_repo.close()
+
+    def test_import_json_rejects_float_and_non_positive_recipe_version(self) -> None:
+        for bad_ver in (0, -1, 1.5, True):
+            payload = json.dumps(
+                {
+                    "name": "Bad Version",
+                    "recipe_version": bad_ver,
+                    "ingredients": [{"name": "A", "percentage": "100.00"}],
+                }
+            )
+            with self.assertRaises(ValueError):
+                import_recipe_from_json(payload)
 
 
 if __name__ == "__main__":

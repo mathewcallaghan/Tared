@@ -14,6 +14,9 @@ class Ingredient:
     def __post_init__(self) -> None:
         if not self.name or not self.name.strip():
             raise ValueError("Ingredient name cannot be empty")
+        clean_name = self.name.strip()
+        if clean_name != self.name:
+            object.__setattr__(self, "name", clean_name)
 
         if not isinstance(self.percentage, Decimal):
             object.__setattr__(self, "percentage", Decimal(str(self.percentage)))
@@ -69,8 +72,11 @@ class Recipe:
     is_draft: bool = False
 
     def __post_init__(self) -> None:
-        if not self.name.strip():
+        clean_name = self.name.strip()
+        if not clean_name:
             raise ValueError("Recipe name cannot be empty")
+        if clean_name != self.name:
+            object.__setattr__(self, "name", clean_name)
         if not self.ingredients:
             raise ValueError("Recipe must contain at least one ingredient")
         if isinstance(self.ingredients, list):
@@ -79,10 +85,13 @@ class Recipe:
         for ing in self.ingredients:
             k = ing.name.strip().lower()
             if k in seen_names:
-                raise ValueError(f"Duplicate ingredient name '{ing.name.strip()}' in recipe '{self.name}'")
+                raise ValueError(f"Duplicate ingredient name '{ing.name.strip()}' in recipe '{clean_name}'")
             seen_names.add(k)
-        if not self.id.strip():
+        clean_id = self.id.strip()
+        if not clean_id:
             object.__setattr__(self, "id", str(uuid.uuid4()))
+        elif clean_id != self.id:
+            object.__setattr__(self, "id", clean_id)
         if self.version < 1:
             object.__setattr__(self, "version", 1)
         if not isinstance(self.is_draft, bool):

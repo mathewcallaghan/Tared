@@ -205,6 +205,8 @@ class PrintBatchSheetDialog(QDialog):
         )
         if not file_path:
             return
+        if not file_path.lower().endswith(".pdf"):
+            file_path = f"{file_path}.pdf"
 
         dest_path = Path(file_path).resolve()
         notes_content = self.notes_input.toPlainText().strip()
@@ -243,14 +245,15 @@ class PrintBatchSheetDialog(QDialog):
                     items=self.batch.items,
                     notes=notes_content,
                     created_at=export_utc_str,
+                    cost_decimals=selected_decimals,
                 )
                 if (
                     self.config is not None
-                    and self.config.is_backup_configured()
+                    and self.config.should_attempt_backup()
                     and not getattr(self.repo, "_is_memory", False)
                 ):
                     try:
-                        target_backup = Path(self.config.auto_backup_dir) / "tared_workspace.json"
+                        target_backup = self.config.resolve_backup_target()
                         export_workspace_to_json_file(self.repo, target_backup, max_rotations=3)
                         self.config.record_backup_result(True)
                     except Exception as bk_err:
@@ -259,8 +262,9 @@ class PrintBatchSheetDialog(QDialog):
                         self.config.record_backup_result(False, str(bk_err))
             db_committed = True
 
-            # Invalidate cache since this batch number is now stored
+            # Invalidate cache and refresh button/tooltip state since this batch number is now stored
             self._batch_cache[batch_number] = True
+            self._on_input_changed()
 
             # 3. Atomically replace destination with verified staging file
             replace_success = False
@@ -280,6 +284,8 @@ class PrintBatchSheetDialog(QDialog):
                             "PDF Files (*.pdf)",
                         )
                         if alt_path:
+                            if not alt_path.lower().endswith(".pdf"):
+                                alt_path = f"{alt_path}.pdf"
                             try:
                                 shutil.copyfile(str(staging_pdf), alt_path)
                                 try:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QUrl
+from PyQt6.QtCore import QSettings, QUrl
 from PyQt6.QtGui import QCloseEvent, QDesktopServices
 from PyQt6.QtWidgets import (
     QDialog,
@@ -28,7 +28,7 @@ from tared.core.updater import (
     is_running_as_appimage,
     restart_appimage,
 )
-from tared.ui.models.update_worker import CheckUpdateWorker, DownloadUpdateWorker
+from tared.ui.models.update_worker import CheckUpdateWorker, DownloadUpdateWorker, track_worker
 
 
 class UpdateDialog(QDialog):
@@ -105,21 +105,38 @@ class UpdateDialog(QDialog):
         self.btn_close.clicked.connect(self._on_close_clicked)
 
     def _start_update_check(self) -> None:
+        if self._check_worker is not None:
+            try:
+                self._check_worker.cancel()
+                try:
+                    self._check_worker.check_finished.disconnect(self._on_check_finished)
+                except (RuntimeError, TypeError):
+                    pass
+                if self._check_worker.isRunning():
+                    self._check_worker.wait(50)
+            except RuntimeError:
+                pass
+            self._check_worker = None
+
         self.status_title.setText("Querying GitHub for latest release...")
         self.btn_action.setEnabled(False)
         self.btn_action.setText("Checking...")
 
-        self._check_worker = CheckUpdateWorker(self._current_version, self)
+        self._check_worker = CheckUpdateWorker(self._current_version, parent=None)
         self._check_worker.check_finished.connect(self._on_check_finished)
-        self._check_worker.finished.connect(self._check_worker.deleteLater)
+        track_worker(self._check_worker)
         self._check_worker.start()
 
     def _on_check_finished(self, is_available: bool, info: UpdateInfo | None, message: str) -> None:
         self.btn_action.setEnabled(True)
 
         if not is_available or info is None:
-            self.status_title.setText("You're up to date!")
-            self.status_subtitle.setText(f"Tared v{self._current_version} is currently the newest version.")
+            if message.startswith("Tared is up to date"):
+                self.status_title.setText("You're up to date!")
+                self.status_subtitle.setText(f"Tared v{self._current_version} is currently the newest version.")
+            else:
+                self.status_title.setText("Update Check Failed")
+                self.status_subtitle.setText(f"Could not verify latest release for v{self._current_version}.")
             self.notes_browser.setText(message)
             self.btn_action.setText("Check Again")
             self.btn_web.setVisible(True)
@@ -165,18 +182,21 @@ class UpdateDialog(QDialog):
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
 
-        self._download_worker = DownloadUpdateWorker(self._update_info, self)
+        self._download_worker = DownloadUpdateWorker(self._update_info, parent=None)
         self._download_worker.progress.connect(self._on_download_progress)
         self._download_worker.download_finished.connect(self._on_download_finished)
         self._download_worker.download_failed.connect(self._on_download_failed)
-        self._download_worker.finished.connect(self._download_worker.deleteLater)
+        track_worker(self._download_worker)
         self._download_worker.start()
 
     def _on_download_progress(self, percent: int, bytes_read: int, total_bytes: int) -> None:
         self.progress_bar.setValue(percent)
         mb_read = bytes_read / (1024 * 1024)
-        mb_total = total_bytes / (1024 * 1024)
-        self.status_title.setText(f"Downloading update: {mb_read:.1f} MB of {mb_total:.1f} MB ({percent}%)")
+        if total_bytes > 0:
+            mb_total = total_bytes / (1024 * 1024)
+            self.status_title.setText(f"Downloading update: {mb_read:.1f} MB of {mb_total:.1f} MB ({percent}%)")
+        else:
+            self.status_title.setText(f"Downloading update: {mb_read:.1f} MB...")
 
     def _on_download_finished(self, staged_path: Path) -> None:
         self._staged_binary = staged_path
@@ -201,6 +221,13 @@ class UpdateDialog(QDialog):
         if not current_appimage or not self._staged_binary:
             return
 
+        if self._update_info is None or not self._update_info.expected_sha256:
+            self._cleanup_staged_binary()
+            QMessageBox.warning(
+                self, "Update Incomplete", "Release metadata is missing. Please retry the update check."
+            )
+            return
+
         reply = QMessageBox.question(
             self,
             "Restart Application",
@@ -212,8 +239,8 @@ class UpdateDialog(QDialog):
             return
 
         parent_window = self.parent()
-        if parent_window is not None and hasattr(parent_window, "close"):
-            if not parent_window.close():
+        if parent_window is not None and hasattr(parent_window, "prepare_for_exit"):
+            if not parent_window.prepare_for_exit():
                 return
 
         try:
@@ -223,30 +250,94 @@ class UpdateDialog(QDialog):
                 expected_sha256=self._update_info.expected_sha256,
                 new_asset_name=self._update_info.asset_name,
             )
-            restart_appimage(final_path)
+            self._staged_binary = None
         except Exception as err:
             QMessageBox.critical(self, "Update Failed", f"Could not replace AppImage binary:\n{err}")
+            return
+
+        if parent_window is not None and hasattr(parent_window, "prepare_restart_resources"):
+            parent_window.prepare_restart_resources()
+        elif parent_window is not None and hasattr(parent_window, "finalize_exit_for_restart"):
+            parent_window.finalize_exit_for_restart()
+        elif parent_window is not None and hasattr(parent_window, "close"):
+            if not parent_window.close():
+                return
+
+        if (
+            parent_window is not None
+            and hasattr(parent_window, "config")
+            and hasattr(parent_window.config, "_settings")
+        ):
+            parent_window.config._settings.sync()
+        else:
+            QSettings().sync()
+
+        try:
+            restart_appimage(final_path)
+        except OSError as err:
+            from PyQt6.QtWidgets import QApplication
+
+            QMessageBox.critical(
+                self,
+                "Restart Failed",
+                f"Update was installed to:\n{final_path}\n\n"
+                f"However, Tared could not restart automatically ({err}).\n"
+                "Please relaunch the application manually.",
+            )
+            self.accept()
+            app = QApplication.instance()
+            if app is not None:
+                app.quit()
 
     def _open_web_releases(self) -> None:
         QDesktopServices.openUrl(QUrl(RELEASES_WEB_URL))
 
-    def _cancel_active_workers(self) -> None:
-        try:
-            if self._download_worker and self._download_worker.isRunning():
-                self._download_worker.cancel()
-                self._download_worker.wait(1500)
-        except RuntimeError:
-            pass
-        try:
-            if self._check_worker and self._check_worker.isRunning():
-                self._check_worker.cancel()
-                self._check_worker.wait(1000)
-        except RuntimeError:
-            pass
+    def _cleanup_staged_binary(self) -> None:
+        if self._staged_binary is not None:
+            try:
+                self._staged_binary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._staged_binary = None
 
-    def closeEvent(self, event: QCloseEvent) -> None:
+    def _cancel_active_workers(self) -> None:
+        if self._download_worker is not None:
+            try:
+                self._download_worker.cancel()
+                for sig in (
+                    self._download_worker.progress,
+                    self._download_worker.download_finished,
+                    self._download_worker.download_failed,
+                ):
+                    try:
+                        sig.disconnect()
+                    except (RuntimeError, TypeError):
+                        pass
+                if self._download_worker.isRunning():
+                    self._download_worker.wait(50)
+            except RuntimeError:
+                pass
+            self._download_worker = None
+
+        if self._check_worker is not None:
+            try:
+                self._check_worker.cancel()
+                try:
+                    self._check_worker.check_finished.disconnect(self._on_check_finished)
+                except (RuntimeError, TypeError):
+                    pass
+                if self._check_worker.isRunning():
+                    self._check_worker.wait(50)
+            except RuntimeError:
+                pass
+            self._check_worker = None
+
+        self._cleanup_staged_binary()
+
+    def closeEvent(self, event: QCloseEvent | None) -> None:
         self._cancel_active_workers()
-        event.accept()
+        if event is not None:
+            event.accept()
 
     def reject(self) -> None:
         self._cancel_active_workers()

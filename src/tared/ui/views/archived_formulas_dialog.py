@@ -1,4 +1,4 @@
-"""Dialog for viewing, inspecting history, restoring, and cleaning up archived formulas."""
+"""Dialog for viewing, inspecting history, restoring, and deleting zero-batch archived formulas."""
 
 from __future__ import annotations
 
@@ -19,20 +19,27 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+from tared.config import ConfigManager
 from tared.storage.base import RecipeRepository, StorageError
 from tared.ui.views.batch_history_dialog import BatchHistoryDialog
 
 
 class ArchivedFormulasDialog(QDialog):
-    """Modal dialog displaying archived formulas with restore, history, and draft cleanup actions."""
+    """Modal dialog displaying archived formulas with restore, history, and safe permanent deletion."""
 
     recipe_restored = pyqtSignal(str)
     formula_duplicated = pyqtSignal(str)
-    draft_deleted = pyqtSignal(str)
+    archived_deleted = pyqtSignal(str)
 
-    def __init__(self, repository: RecipeRepository, parent: Any = None) -> None:
+    def __init__(
+        self,
+        repository: RecipeRepository,
+        parent: Any = None,
+        config: ConfigManager | None = None,
+    ) -> None:
         super().__init__(parent)
         self.repo = repository
+        self.config = config
         self.setWindowTitle("Archived Formulas")
         self.resize(860, 460)
 
@@ -45,10 +52,10 @@ class ArchivedFormulasDialog(QDialog):
 
         info_label = QLabel(
             "Archived formulas are hidden from the main library while retaining all revision snapshots "
-            "and production batch logs. Restore a formula to edit it, or view its history directly."
+            "and production batch logs. Formulas with zero recorded batches can be permanently deleted."
         )
         info_label.setWordWrap(True)
-        info_label.setStyleSheet("color: #475569; font-size: 9pt; margin-bottom: 4px;")
+        info_label.setStyleSheet("font-size: 9pt; margin-bottom: 4px;")
         layout.addWidget(info_label)
 
         self.search_input = QLineEdit()
@@ -73,6 +80,7 @@ class ArchivedFormulasDialog(QDialog):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
 
         header = self.table.horizontalHeader()
+        assert header is not None
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
@@ -86,11 +94,9 @@ class ArchivedFormulasDialog(QDialog):
         self.btn_history.setStyleSheet("padding: 6px 14px;")
         self.btn_history.setEnabled(False)
 
-        self.btn_delete_draft = QPushButton("Delete Draft...")
-        self.btn_delete_draft.setStyleSheet("color: #dc3545; padding: 6px 14px;")
-        self.btn_delete_draft.setToolTip("Permanently delete an unreleased v1 draft with no revisions or batches")
-        self.btn_delete_draft.setVisible(False)
-        self.btn_delete_draft.setEnabled(False)
+        self.btn_delete_permanent = QPushButton("Delete Permanently...")
+        self.btn_delete_permanent.setStyleSheet("color: #dc3545; padding: 6px 14px;")
+        self.btn_delete_permanent.setEnabled(False)
 
         self.btn_restore = QPushButton("Restore to Active Library")
         self.btn_restore.setStyleSheet("font-weight: bold; padding: 6px 14px;")
@@ -100,7 +106,7 @@ class ArchivedFormulasDialog(QDialog):
         self.btn_close.setStyleSheet("padding: 6px 14px;")
 
         btn_layout.addWidget(self.btn_history)
-        btn_layout.addWidget(self.btn_delete_draft)
+        btn_layout.addWidget(self.btn_delete_permanent)
         btn_layout.addStretch()
         btn_layout.addWidget(self.btn_restore)
         btn_layout.addWidget(self.btn_close)
@@ -110,7 +116,7 @@ class ArchivedFormulasDialog(QDialog):
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         self.table.itemDoubleClicked.connect(self._on_row_double_clicked)
         self.btn_history.clicked.connect(self._open_selected_history)
-        self.btn_delete_draft.clicked.connect(self._delete_selected_draft)
+        self.btn_delete_permanent.clicked.connect(self._delete_selected_permanently)
         self.btn_restore.clicked.connect(self._restore_selected)
         self.btn_close.clicked.connect(self.accept)
 
@@ -146,20 +152,40 @@ class ArchivedFormulasDialog(QDialog):
         if self.search_input.text().strip():
             self._filter_rows(self.search_input.text())
 
-        if self._archived:
-            self.table.selectRow(0)
-        else:
-            self._on_selection_changed()
+        first_visible = next(
+            (r for r in range(self.table.rowCount()) if not self.table.isRowHidden(r)),
+            -1,
+        )
+        self.table.clearSelection()
+        if first_visible >= 0:
+            self.table.selectRow(first_visible)
+        self._on_selection_changed()
 
     def _filter_rows(self, text: str) -> None:
         query = text.strip().lower()
         for row in range(self.table.rowCount()):
-            name = (self.table.item(row, 0).text() if self.table.item(row, 0) else "").lower()
-            desc = (self.table.item(row, 5).text() if self.table.item(row, 5) else "").lower()
+            c0 = self.table.item(row, 0)
+            c5 = self.table.item(row, 5)
+            name = (c0.text() if c0 is not None else "").lower()
+            desc = (c5.text() if c5 is not None else "").lower()
             self.table.setRowHidden(row, query not in name and query not in desc)
 
+        sel_model = self.table.selectionModel()
+        selected = sel_model.selectedRows() if sel_model is not None else []
+        if selected and self.table.isRowHidden(selected[0].row()):
+            first_visible = next(
+                (r for r in range(self.table.rowCount()) if not self.table.isRowHidden(r)),
+                -1,
+            )
+            if first_visible >= 0:
+                self.table.selectRow(first_visible)
+            else:
+                self.table.clearSelection()
+                self._on_selection_changed()
+
     def _get_selected_record(self) -> dict[str, Any] | None:
-        selected = self.table.selectionModel().selectedRows()
+        sel_model = self.table.selectionModel()
+        selected = sel_model.selectedRows() if sel_model is not None else []
         if not selected:
             return None
         row = selected[0].row()
@@ -175,8 +201,8 @@ class ArchivedFormulasDialog(QDialog):
         if rec is None:
             self.btn_history.setEnabled(False)
             self.btn_history.setToolTip("")
-            self.btn_delete_draft.setVisible(False)
-            self.btn_delete_draft.setEnabled(False)
+            self.btn_delete_permanent.setEnabled(False)
+            self.btn_delete_permanent.setToolTip("")
             return
 
         rev_count = int(rec.get("revision_count", 0))
@@ -185,9 +211,14 @@ class ArchivedFormulasDialog(QDialog):
         self.btn_history.setEnabled(has_history)
         self.btn_history.setToolTip("" if has_history else "No saved revisions or production batches yet.")
 
-        is_deletable_draft = bool(rec.get("is_draft")) and not has_history
-        self.btn_delete_draft.setVisible(is_deletable_draft)
-        self.btn_delete_draft.setEnabled(is_deletable_draft)
+        can_delete = batch_count == 0
+        self.btn_delete_permanent.setEnabled(can_delete)
+        if can_delete:
+            self.btn_delete_permanent.setToolTip("Permanently delete this archived formula and its revision history.")
+        else:
+            self.btn_delete_permanent.setToolTip(
+                f"Cannot delete: {batch_count} production batch record(s) reference this formula."
+            )
 
     def _on_row_double_clicked(self) -> None:
         if self.btn_history.isEnabled():
@@ -203,23 +234,40 @@ class ArchivedFormulasDialog(QDialog):
             repository=self.repo,
             parent=self,
             allow_restore=False,
+            config=self.config,
         )
         dialog.formula_duplicated.connect(self.formula_duplicated.emit)
         dialog.exec()
 
-    def _delete_selected_draft(self) -> None:
+    def _delete_selected_permanently(self) -> None:
         rec = self._get_selected_record()
         if rec is None:
             return
 
         recipe_id = str(rec["id"])
         recipe_name = str(rec.get("name", ""))
+        rev_count = int(rec.get("revision_count", 0))
+        batch_count = int(rec.get("batch_count", 0))
+
+        if batch_count > 0:
+            QMessageBox.warning(
+                self,
+                "Cannot Delete Formula",
+                f"'{recipe_name}' has {batch_count} production batch record(s) and cannot be deleted.",
+            )
+            return
+
+        rev_detail = (
+            f"and all {rev_count} saved revision snapshot(s)"
+            if rev_count > 0
+            else "(unreleased draft with no saved revisions)"
+        )
         reply = QMessageBox.question(
             self,
-            "Delete Draft Permanently",
+            "Delete Archived Formula Permanently",
             (
-                f"Permanently delete unreleased draft '{recipe_name}'?\n\n"
-                "This draft has no finalized revisions or production batches and cannot be recovered."
+                f"Permanently delete '{recipe_name}' {rev_detail}?\n\n"
+                "No production batches reference this formula. This action cannot be undone."
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
@@ -228,11 +276,11 @@ class ArchivedFormulasDialog(QDialog):
             return
 
         try:
-            if self.repo.delete_draft_recipe(recipe_id):
+            if self.repo.delete_archived_recipe(recipe_id):
                 self._load_archived()
-                self.draft_deleted.emit(recipe_id)
+                self.archived_deleted.emit(recipe_id)
         except StorageError as err:
-            QMessageBox.critical(self, "Delete Draft Error", f"Failed to delete draft:\n{err}")
+            QMessageBox.critical(self, "Delete Error", f"Failed to delete archived formula:\n{err}")
 
     def _restore_selected(self) -> None:
         rec = self._get_selected_record()
